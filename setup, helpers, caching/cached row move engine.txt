@@ -1,0 +1,453 @@
+# Cached row move engine for inline notebook game logic
+
+import pickle
+
+# Keep originals before patching notebook globals
+ORIGINAL_APPLY_MOVE_BITBOARD = apply_move_bitboard
+ORIGINAL_GET_LEGAL_MOVES = get_legal_moves
+ORIGINAL_HAS_LEGAL_MOVES = has_legal_moves
+
+MOVE_ROW_CACHE_VERSION = "v3"
+MOVE_ROW_CACHE_REL_PATH = os.path.join(
+    "engine", f"move_row_cache_{MOVE_ROW_CACHE_VERSION}.pkl.gz"
+)
+
+NIBBLE_MASK_4 = 0xF
+ROW_MASK_16 = 0xFFFF
+
+
+# -------------------------------------------------------------------
+# Cache file helpers
+# -------------------------------------------------------------------
+
+def _move_cache_read_path(rel_path):
+    candidate = os.path.join(ARTIFACT_WRITE_ROOT, rel_path)
+    if os.path.exists(candidate):
+        return candidate
+
+    marker = f"/{ARTIFACT_ROOT_NAME}/"
+    for dirname, _, filenames in os.walk("/kaggle/input"):
+        if marker not in dirname:
+            continue
+
+        relative_dir = dirname.split(marker, 1)[1]
+        for filename in filenames:
+            maybe_rel = os.path.join(relative_dir, filename) if relative_dir else filename
+            if maybe_rel == rel_path:
+                return os.path.join(dirname, filename)
+
+    return None
+
+
+def _move_cache_write_path(rel_path):
+    path = os.path.join(ARTIFACT_WRITE_ROOT, rel_path)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    return path
+
+
+# -------------------------------------------------------------------
+# Verify row-major layout
+# -------------------------------------------------------------------
+
+def verify_row_major_layout():
+    """
+    Verify that board_to_bitboard uses standard row-major nibble layout:
+    shift = 4 * (4*r + c)
+    """
+    for r in range(4):
+        for c in range(4):
+            board = [[0] * 4 for _ in range(4)]
+            board[r][c] = 2
+            bitboard = board_to_bitboard(board)
+
+            found = [
+                4 * nib_idx
+                for nib_idx in range(16)
+                if ((bitboard >> (4 * nib_idx)) & NIBBLE_MASK_4) != 0
+            ]
+            expected_shift = 4 * (4 * r + c)
+
+            if found != [expected_shift]:
+                raise AssertionError(
+                    f"Backend is not row-major as expected at cell {(r, c)}. "
+                    f"Expected shift {expected_shift}, found {found}"
+                )
+
+    print("[OK] row-major nibble layout verified")
+
+
+verify_row_major_layout()
+
+
+# -------------------------------------------------------------------
+# 16-bit row helpers
+# -------------------------------------------------------------------
+
+def _unpack_row16(row16):
+    return [(row16 >> (4 * i)) & NIBBLE_MASK_4 for i in range(4)]
+
+
+def _pack_row16(exps):
+    row16 = 0
+    for i, exp in enumerate(exps):
+        row16 |= (exp & NIBBLE_MASK_4) << (4 * i)
+    return row16
+
+
+def _reverse_row16(row16):
+    return (
+        ((row16 & 0x000F) << 12) |
+        ((row16 & 0x00F0) << 4)  |
+        ((row16 & 0x0F00) >> 4)  |
+        ((row16 & 0xF000) >> 12)
+    )
+
+
+def _move_row_left_16(row16):
+    """
+    Process one logical 4-cell row stored as exponents in a 16-bit integer.
+    Returns: (new_row16, reward, changed)
+    """
+    exps = [x for x in _unpack_row16(row16) if x != 0]
+
+    merged = []
+    reward = 0
+    i = 0
+
+    while i < len(exps):
+        if i + 1 < len(exps) and exps[i] == exps[i + 1]:
+            new_exp = exps[i] + 1
+            merged.append(new_exp)
+            reward += 1 << new_exp
+            i += 2
+        else:
+            merged.append(exps[i])
+            i += 1
+
+    merged.extend([0] * (4 - len(merged)))
+    new_row16 = _pack_row16(merged)
+    return new_row16, reward, (new_row16 != row16)
+
+
+# -------------------------------------------------------------------
+# Move row cache
+# -------------------------------------------------------------------
+
+def _build_move_row_cache():
+    row_left_result = [0] * 65536
+    row_left_reward = [0] * 65536
+    row_left_changed = [False] * 65536
+
+    row_right_result = [0] * 65536
+    row_right_reward = [0] * 65536
+    row_right_changed = [False] * 65536
+
+    for row16 in range(65536):
+        new_left, reward_left, changed_left = _move_row_left_16(row16)
+        row_left_result[row16] = new_left
+        row_left_reward[row16] = reward_left
+        row_left_changed[row16] = changed_left
+
+    for row16 in range(65536):
+        reversed_row = _reverse_row16(row16)
+        moved_reversed = row_left_result[reversed_row]
+        restored_row = _reverse_row16(moved_reversed)
+
+        row_right_result[row16] = restored_row
+        row_right_reward[row16] = row_left_reward[reversed_row]
+        row_right_changed[row16] = (restored_row != row16)
+
+    return {
+        "row_left_result": row_left_result,
+        "row_left_reward": row_left_reward,
+        "row_left_changed": row_left_changed,
+        "row_right_result": row_right_result,
+        "row_right_reward": row_right_reward,
+        "row_right_changed": row_right_changed,
+    }
+
+
+def load_or_build_move_row_cache(force_rebuild=False):
+    cache_path = None if force_rebuild else _move_cache_read_path(MOVE_ROW_CACHE_REL_PATH)
+
+    if cache_path is not None:
+        with gzip.open(cache_path, "rb") as f:
+            cache = pickle.load(f)
+        print(f"[LOAD] move row cache from {cache_path}")
+        return cache
+
+    cache = _build_move_row_cache()
+    cache_path = _move_cache_write_path(MOVE_ROW_CACHE_REL_PATH)
+
+    with gzip.open(cache_path, "wb") as f:
+        pickle.dump(cache, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+    print(f"[SAVE] move row cache to {cache_path}")
+    return cache
+
+
+MOVE_ROW_CACHE = load_or_build_move_row_cache(force_rebuild=False)
+
+LEFT_MOVE_RESULT = MOVE_ROW_CACHE["row_left_result"]
+LEFT_MOVE_REWARD = MOVE_ROW_CACHE["row_left_reward"]
+LEFT_MOVE_CHANGED = MOVE_ROW_CACHE["row_left_changed"]
+
+RIGHT_MOVE_RESULT = MOVE_ROW_CACHE["row_right_result"]
+RIGHT_MOVE_REWARD = MOVE_ROW_CACHE["row_right_reward"]
+RIGHT_MOVE_CHANGED = MOVE_ROW_CACHE["row_right_changed"]
+
+
+# -------------------------------------------------------------------
+# Fast transpose
+# -------------------------------------------------------------------
+
+def _transpose_bitboard_fast(bitboard):
+    a1 = bitboard & 0xF0F00F0FF0F00F0F
+    a2 = bitboard & 0x0000F0F00000F0F0
+    a3 = bitboard & 0x0F0F00000F0F0000
+    a = a1 | (a2 << 12) | (a3 >> 12)
+    b1 = a & 0xFF00FF0000FF00FF
+    b2 = a & 0x00FF00FF00000000
+    b3 = a & 0x00000000FF00FF00
+    return b1 | (b2 >> 24) | (b3 << 24)
+
+
+# -------------------------------------------------------------------
+# Fast bitboard move engine
+# -------------------------------------------------------------------
+
+def move_left_bitboard_fast(bitboard):
+    result = 0
+    reward = 0
+    changed = False
+
+    for row_idx in range(4):
+        row16 = (bitboard >> (16 * row_idx)) & ROW_MASK_16
+        result |= LEFT_MOVE_RESULT[row16] << (16 * row_idx)
+        reward += LEFT_MOVE_REWARD[row16]
+        changed = changed or LEFT_MOVE_CHANGED[row16]
+
+    return result, reward, changed
+
+
+def move_right_bitboard_fast(bitboard):
+    result = 0
+    reward = 0
+    changed = False
+
+    for row_idx in range(4):
+        row16 = (bitboard >> (16 * row_idx)) & ROW_MASK_16
+        result |= RIGHT_MOVE_RESULT[row16] << (16 * row_idx)
+        reward += RIGHT_MOVE_REWARD[row16]
+        changed = changed or RIGHT_MOVE_CHANGED[row16]
+
+    return result, reward, changed
+
+
+def move_up_bitboard_fast(bitboard):
+    transposed = _transpose_bitboard_fast(bitboard)
+    moved, reward, _ = move_left_bitboard_fast(transposed)
+    restored = _transpose_bitboard_fast(moved)
+    return restored, reward, (restored != bitboard)
+
+
+def move_down_bitboard_fast(bitboard):
+    transposed = _transpose_bitboard_fast(bitboard)
+    moved, reward, _ = move_right_bitboard_fast(transposed)
+    restored = _transpose_bitboard_fast(moved)
+    return restored, reward, (restored != bitboard)
+
+
+def apply_move_bitboard_fast(bitboard, direction):
+    direction = direction.lower().strip()
+
+    if direction == "left":
+        return move_left_bitboard_fast(bitboard)
+    if direction == "right":
+        return move_right_bitboard_fast(bitboard)
+    if direction == "up":
+        return move_up_bitboard_fast(bitboard)
+    if direction == "down":
+        return move_down_bitboard_fast(bitboard)
+
+    raise ValueError(f"Invalid move '{direction}'. Valid moves: ['down', 'left', 'right', 'up']")
+
+
+def get_legal_moves_fast(bitboard):
+    legal = []
+
+    _, _, changed = move_left_bitboard_fast(bitboard)
+    if changed:
+        legal.append("left")
+
+    _, _, changed = move_right_bitboard_fast(bitboard)
+    if changed:
+        legal.append("right")
+
+    _, _, changed = move_up_bitboard_fast(bitboard)
+    if changed:
+        legal.append("up")
+
+    _, _, changed = move_down_bitboard_fast(bitboard)
+    if changed:
+        legal.append("down")
+
+    return legal
+
+
+def has_legal_moves_fast(bitboard):
+    _, _, changed = move_left_bitboard_fast(bitboard)
+    if changed:
+        return True
+
+    _, _, changed = move_right_bitboard_fast(bitboard)
+    if changed:
+        return True
+
+    _, _, changed = move_up_bitboard_fast(bitboard)
+    if changed:
+        return True
+
+    _, _, changed = move_down_bitboard_fast(bitboard)
+    return changed
+
+
+# -------------------------------------------------------------------
+# Cached env
+# -------------------------------------------------------------------
+
+class CachedMoveGame2048Env:
+    def __init__(self, target=2048, rng=None):
+        self.target = target
+        self.rng = rng or random.Random()
+        self.board = 0
+        self.score = 0
+        self.done = False
+        self.won = False
+        self.move_count = 0
+        self.reset_bitboard()
+
+    def reset(self):
+        return bitboard_to_board(self.reset_bitboard())
+
+    def reset_bitboard(self):
+        self.board = create_initial_bitboard_fast(self.rng)
+        self.score = 0
+        self.done = False
+        self.won = False
+        self.move_count = 0
+        return self.board
+
+    def get_state(self):
+        return bitboard_to_board(self.board)
+
+    def get_bitboard_state(self):
+        return self.board
+
+    def get_score(self):
+        return self.score
+
+    def get_move_count(self):
+        return self.move_count
+
+    def get_max_tile(self):
+        return get_max_tile_fast(self.board)
+
+    def get_legal_moves(self):
+        return get_legal_moves_fast(self.board)
+
+    def step(self, action):
+        """
+        Public board-returning step, keeps old behavior.
+        """
+        next_board, reward, done, info = self.step_bitboard(action, include_legal_moves=True)
+        return bitboard_to_board(next_board), reward, done, info
+
+    def step_bitboard(self, action, include_legal_moves=False):
+        """
+        Fast bitboard-returning step for experiment loops.
+        """
+        if self.done:
+            raise RuntimeError("Cannot call step() after game is over. Call reset() first.")
+
+        new_board, reward, changed = apply_move_bitboard_fast(self.board, action)
+
+        if changed:
+            self.score += reward
+            self.board = spawn_random_tile_bitboard_fast(new_board, self.rng)
+            self.move_count += 1
+        else:
+            self.board = new_board
+
+        max_tile = get_max_tile_fast(self.board)
+        self.won = (max_tile >= self.target)
+        self.done = not has_legal_moves_fast(self.board)
+
+        legal_moves = []
+        if include_legal_moves and not self.done:
+            legal_moves = get_legal_moves_fast(self.board)
+
+        info = {
+            "changed": changed,
+            "score": self.score,
+            "max_tile": max_tile,
+            "won": self.won,
+            "move_count": self.move_count,
+            "legal_moves": legal_moves,
+        }
+
+        return self.board, reward, self.done, info
+
+
+# -------------------------------------------------------------------
+# Verification
+# -------------------------------------------------------------------
+
+def verify_fast_move_engine(num_random_boards=300, seed=1234):
+    rng = random.Random(seed)
+
+    for _ in range(num_random_boards):
+        bitboard = 0
+        for idx in range(16):
+            exp = rng.randint(0, 11)
+            bitboard |= exp << (4 * idx)
+
+        for direction in ("left", "right", "up", "down"):
+            expected = ORIGINAL_APPLY_MOVE_BITBOARD(bitboard, direction)
+            got = apply_move_bitboard_fast(bitboard, direction)
+
+            if expected != got:
+                raise AssertionError(
+                    f"Mismatch on direction={direction}\nexpected={expected}\ngot={got}\nbitboard={bitboard}"
+                )
+
+        expected_legal = ORIGINAL_GET_LEGAL_MOVES(bitboard)
+        got_legal = get_legal_moves_fast(bitboard)
+        if expected_legal != got_legal:
+            raise AssertionError(
+                f"Legal move mismatch\nexpected={expected_legal}\ngot={got_legal}\nbitboard={bitboard}"
+            )
+
+        expected_has = ORIGINAL_HAS_LEGAL_MOVES(bitboard)
+        got_has = has_legal_moves_fast(bitboard)
+        if expected_has != got_has:
+            raise AssertionError(
+                f"has_legal_moves mismatch\nexpected={expected_has}\ngot={got_has}\nbitboard={bitboard}"
+            )
+
+    print(f"[OK] fast move engine verified on {num_random_boards} random boards")
+
+
+verify_fast_move_engine(num_random_boards=300, seed=1234)
+
+
+# -------------------------------------------------------------------
+# Patch notebook globals
+# -------------------------------------------------------------------
+
+Game2048Env = CachedMoveGame2048Env
+apply_move_bitboard = apply_move_bitboard_fast
+get_legal_moves = get_legal_moves_fast
+has_legal_moves = has_legal_moves_fast
+
+print("[PATCHED] Notebook now uses the cached row move engine")

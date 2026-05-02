@@ -1,0 +1,74 @@
+# This cell initializes libraries, notebook-wide configuration,
+# and in-session caches for the inline 2048 game logic.
+# It assumes the game cells (board, logic, spawn, state, env) were already run.
+
+import os
+import re
+import json
+import gzip
+import time
+import queue
+import threading
+import random
+from collections import Counter
+from multiprocessing import Manager
+
+import pandas as pd
+import matplotlib.pyplot as plt
+import ipywidgets as widgets
+
+from tqdm.auto import tqdm
+from joblib import Parallel, delayed
+from IPython.display import display, clear_output, HTML
+
+# -------------------------------------------------------------------
+# Global config
+# -------------------------------------------------------------------
+
+ARTIFACT_ROOT_NAME = "2048_outputs"
+ARTIFACT_WRITE_ROOT = f"/kaggle/working/{ARTIFACT_ROOT_NAME}"
+
+BASE_SEED = 1000
+N_JOBS = 4
+MAX_STEPS = 20000
+
+# How often live monitor boards are updated from each worker, in moves.
+DEFAULT_SNAPSHOT_EVERY_STEPS = 25
+
+# How often the notebook monitor refreshes visually.
+DEFAULT_MONITOR_REFRESH_SECONDS = 0.25
+
+os.makedirs(ARTIFACT_WRITE_ROOT, exist_ok=True)
+
+# -------------------------------------------------------------------
+# Sanity check: required inline game objects must already exist
+# -------------------------------------------------------------------
+
+_REQUIRED_GAME_SYMBOLS = [
+    "Game2048Env",
+    "apply_move_bitboard",
+    "get_legal_moves",
+    "has_legal_moves",
+    "bitboard_to_board",
+    "board_to_bitboard",
+    "create_initial_bitboard",
+    "spawn_random_tile_bitboard",
+    "get_max_tile",
+    "has_won",
+    "is_game_over",
+]
+
+_missing_symbols = [name for name in _REQUIRED_GAME_SYMBOLS if name not in globals()]
+if _missing_symbols:
+    raise RuntimeError(
+        "Run the game logic cells first. Missing symbols: "
+        + ", ".join(_missing_symbols)
+    )
+
+print("Inline 2048 game logic detected and ready.")
+
+# -------------------------------------------------------------------
+# In-session memory cache
+# -------------------------------------------------------------------
+
+EXPERIMENT_MEMORY_CACHE = {}

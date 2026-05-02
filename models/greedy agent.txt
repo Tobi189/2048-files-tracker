@@ -1,0 +1,47 @@
+# This cell defines the greedy baseline agent and caches its 100-game results and full replays.
+
+def greedy_agent(board, legal_moves, rng=None):
+    """
+    Choose the move with the highest immediate merge reward.
+    Use number of empty cells as a tie-breaker.
+    """
+    rng = rng or random
+
+    # best_moves stores moves tied for the current best immediate score.
+    best_moves = []
+
+    # best_reward stores the highest immediate reward seen so far.
+    best_reward = -1
+
+    # best_empty stores the best empty-cell count among tied immediate rewards.
+    best_empty = -1
+
+    for move in legal_moves:
+        next_board, reward, changed = apply_move(board, move)
+        empty_count = len(get_empty_cells(next_board))
+
+        if reward > best_reward:
+            best_reward = reward
+            best_empty = empty_count
+            best_moves = [move]
+        elif reward == best_reward:
+            if empty_count > best_empty:
+                best_empty = empty_count
+                best_moves = [move]
+            elif empty_count == best_empty:
+                best_moves.append(move)
+
+    return rng.choice(best_moves)
+
+GREEDY_GAMES = 100
+
+greedy_artifact_100 = run_experiment_cached(
+    name="greedy",
+    agent_fn=greedy_agent,
+    n_games=GREEDY_GAMES,
+    base_seed=BASE_SEED,
+    save_replays=SAVE_REPLAYS_FOR_100,
+    force=False,
+)
+
+greedy_artifact_100["summary"]

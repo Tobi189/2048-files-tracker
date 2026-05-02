@@ -1,0 +1,1327 @@
+# Notebook helpers
+# - artifact loading/saving
+# - experiment running / caching
+# - live monitor
+# - replay rebuilding / replay viewer
+# - CSV table saving for per-game results
+
+# -------------------------------------------------------------------
+# Artifact indexing
+# -------------------------------------------------------------------
+
+INPUT_ARTIFACT_INDEX = {}
+
+def build_input_artifact_index():
+    """
+    Scan /kaggle/input for prior output files stored under ARTIFACT_ROOT_NAME
+    so experiments can be reloaded after notebook restart.
+    """
+    global INPUT_ARTIFACT_INDEX
+    INPUT_ARTIFACT_INDEX = {}
+
+    for dirname, _, filenames in os.walk("/kaggle/input"):
+        marker = f"/{ARTIFACT_ROOT_NAME}/"
+        if marker not in dirname:
+            continue
+
+        relative_dir = dirname.split(marker, 1)[1]
+
+        for filename in filenames:
+            relative_path = os.path.join(relative_dir, filename) if relative_dir else filename
+            full_path = os.path.join(dirname, filename)
+
+            if relative_path not in INPUT_ARTIFACT_INDEX:
+                INPUT_ARTIFACT_INDEX[relative_path] = full_path
+
+
+build_input_artifact_index()
+
+# -------------------------------------------------------------------
+# Artifact path helpers
+# -------------------------------------------------------------------
+
+def normalize_experiment_name(name: str) -> str:
+    """
+    Make experiment names filesystem-friendly but still readable.
+    """
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", name.strip())
+    return cleaned.strip("_")
+
+
+def artifact_cache_key(name, n_games, base_seed, max_steps):
+    return (normalize_experiment_name(name), int(n_games), int(base_seed), int(max_steps))
+
+
+def artifact_rel_dir(name, n_games, base_seed, max_steps):
+    safe_name = normalize_experiment_name(name)
+    return os.path.join(
+        "experiments",
+        safe_name,
+        f"n_{n_games}_seed_{base_seed}_steps_{max_steps}",
+    )
+
+
+def artifact_rel_paths(name, n_games, base_seed, max_steps):
+    root = artifact_rel_dir(name, n_games, base_seed, max_steps)
+    return {
+        "summary": os.path.join(root, "summary.json"),
+        "games": os.path.join(root, "games.json.gz"),
+        "replays": os.path.join(root, "replays.json.gz"),
+    }
+
+
+def games_table_rel_path(name, n_games, base_seed, max_steps):
+    root = artifact_rel_dir(name, n_games, base_seed, max_steps)
+    return os.path.join(root, "games_table.csv")
+
+
+def artifact_write_path(rel_path):
+    return os.path.join(ARTIFACT_WRITE_ROOT, rel_path)
+
+
+def artifact_read_path(rel_path):
+    candidate = artifact_write_path(rel_path)
+    if os.path.exists(candidate):
+        return candidate
+    return INPUT_ARTIFACT_INDEX.get(rel_path)
+
+
+def save_json(obj, rel_path, compress=False):
+    path = artifact_write_path(rel_path)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    if compress:
+        with gzip.open(path, "wt", encoding="utf-8") as f:
+            json.dump(obj, f)
+    else:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(obj, f)
+
+    return path
+
+
+def load_json(rel_path, compress=False):
+    path = artifact_read_path(rel_path)
+    if path is None:
+        raise FileNotFoundError(f"Artifact not found: {rel_path}")
+
+    if compress:
+        with gzip.open(path, "rt", encoding="utf-8") as f:
+            return json.load(f)
+    else:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+
+def save_games_table_csv(games_data, name, n_games, base_seed, max_steps):
+    """
+    Save a user-friendly per-game CSV table into Output.
+    """
+    rel_path = games_table_rel_path(name, n_games, base_seed, max_steps)
+    path = artifact_write_path(rel_path)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    df = pd.DataFrame([
+        {
+            "game_index": g["game_index"],
+            "seed": g["seed"],
+            "final_score": g["final_score"],
+            "max_tile": g["max_tile"],
+            "move_count": g["move_count"],
+            "duration_sec": g["duration_sec"],
+            "won": g["won"],
+        }
+        for g in games_data
+    ])
+
+    df.to_csv(path, index=False)
+    return path
+
+
+def _normalize_loaded_summary(summary):
+    """
+    JSON turns dict keys into strings. Convert tile_counts keys back to int.
+    """
+    if "tile_counts" in summary and isinstance(summary["tile_counts"], dict):
+        summary["tile_counts"] = {int(k): v for k, v in summary["tile_counts"].items()}
+    return summary
+
+# -------------------------------------------------------------------
+# Summary helpers
+# -------------------------------------------------------------------
+
+def summarize_games(games):
+    """
+    Compute summary statistics from per-game results.
+    """
+    if not games:
+        raise ValueError("Cannot summarize empty game list.")
+
+    scores = [g["final_score"] for g in games]
+    max_tiles = [g["max_tile"] for g in games]
+    move_counts = [g["move_count"] for g in games]
+    durations = [g["duration_sec"] for g in games]
+    wins = sum(g["won"] for g in games)
+
+    best_max_tile = max(max_tiles)
+    best_tile_count = sum(1 for x in max_tiles if x == best_max_tile)
+
+    return {
+        "games": len(games),
+        "avg_score": sum(scores) / len(scores),
+        "best_score": max(scores),
+        "avg_max_tile": sum(max_tiles) / len(max_tiles),
+        "best_max_tile": best_max_tile,
+        "best_tile_count": best_tile_count,
+        "avg_move_count": sum(move_counts) / len(move_counts),
+        "avg_duration_sec": sum(durations) / len(durations),
+        "wins": wins,
+        "tile_counts": dict(Counter(max_tiles)),
+    }
+
+
+def strip_frames_from_replay(replay):
+    """
+    Keep only summary-level info for games.json.gz.
+    """
+    return {
+        "game_index": replay["game_index"],
+        "seed": replay["seed"],
+        "final_score": replay["final_score"],
+        "max_tile": replay["max_tile"],
+        "move_count": replay["move_count"],
+        "won": replay["won"],
+        "duration_sec": replay["duration_sec"],
+    }
+
+
+def reached_at_least_df(artifact, thresholds=(128, 256, 512, 1024, 2048, 4096, 8192, 16384)):
+    games = artifact["games_data"]
+    total = len(games)
+
+    rows = []
+    for threshold in thresholds:
+        count = sum(1 for g in games if g["max_tile"] >= threshold)
+        rows.append({
+            "threshold": threshold,
+            "count": count,
+            "percent": 100.0 * count / total,
+        })
+
+    return pd.DataFrame(rows)
+
+
+def _sorted_tile_counts(tile_counts):
+    return {int(k): tile_counts[k] for k in sorted(tile_counts)}
+
+
+def _summary_display_payload(summary):
+    return {
+        "games": int(summary["games"]),
+        "avg_score": round(float(summary["avg_score"]), 3),
+        "best_score": int(summary["best_score"]),
+        "avg_max_tile": round(float(summary["avg_max_tile"]), 3),
+        "best_max_tile": int(summary["best_max_tile"]),
+        "avg_move_count": round(float(summary["avg_move_count"]), 3),
+        "wins": int(summary["wins"]),
+        "tile_counts": _sorted_tile_counts(summary["tile_counts"]),
+    }
+
+
+def _summary_display_text(summary, target_games=None):
+    payload = _summary_display_payload(summary)
+
+    if target_games is None:
+        prefix = f"{payload['games']}-game summary:"
+    else:
+        prefix = f"{int(target_games)}-game summary (completed {payload['games']}/{int(target_games)}):"
+
+    return f"{prefix}\n{payload}"
+
+# -------------------------------------------------------------------
+# Board rendering helpers
+# -------------------------------------------------------------------
+
+tile_colors = {
+    0: "#cdc1b4",
+    2: "#eee4da",
+    4: "#ede0c8",
+    8: "#f2b179",
+    16: "#f59563",
+    32: "#f67c5f",
+    64: "#f65e3b",
+    128: "#edcf72",
+    256: "#edcc61",
+    512: "#edc850",
+    1024: "#edc53f",
+    2048: "#edc22e",
+    4096: "#3c3a32",
+    8192: "#1f1f1f",
+    16384: "#111111",
+    32768: "#000000",
+}
+
+
+def render_board_html_from_bitboard(bitboard):
+    board = bitboard_to_board(int(bitboard))
+    cells = []
+
+    for row in board:
+        for value in row:
+            color = tile_colors.get(value, "#111111")
+            text_color = "#776e65" if value <= 4 else "white"
+            text = "" if value == 0 else str(value)
+
+            cells.append(
+                f"""
+                <div style="
+                    width:68px;
+                    height:68px;
+                    border-radius:6px;
+                    background:{color};
+                    color:{text_color};
+                    display:flex;
+                    align-items:center;
+                    justify-content:center;
+                    font-weight:700;
+                    font-size:20px;
+                    font-family:Arial,sans-serif;
+                ">{text}</div>
+                """
+            )
+
+    return f"""
+    <div style="
+        display:grid;
+        grid-template-columns:repeat(4, 68px);
+        gap:6px;
+        background:#bbada0;
+        padding:8px;
+        border-radius:8px;
+        width:max-content;
+    ">
+        {''.join(cells)}
+    </div>
+    """
+
+
+def render_monitor_slot_html(slot_idx, slot_state):
+    if slot_state is None:
+        return f"""
+        <div style="border:1px solid #ddd;border-radius:10px;padding:12px;">
+            <div style="font-weight:700;margin-bottom:8px;">CPU Slot {slot_idx + 1}</div>
+            <div style="color:#777;">Waiting...</div>
+        </div>
+        """
+
+    status = slot_state.get("status", "running")
+    game_index = slot_state.get("game_index", "?")
+    seed = slot_state.get("seed", "?")
+    step = slot_state.get("step", 0)
+    score = slot_state.get("score", 0)
+    max_tile = slot_state.get("max_tile", 0)
+    action = slot_state.get("action", None)
+    bitboard = slot_state["bitboard"]
+
+    board_html = render_board_html_from_bitboard(bitboard)
+
+    return f"""
+    <div style="border:1px solid #ddd;border-radius:10px;padding:12px;">
+        <div style="font-weight:700;margin-bottom:6px;">CPU Slot {slot_idx + 1}</div>
+        <div style="font-size:13px;line-height:1.5;margin-bottom:8px;">
+            <div><b>Status:</b> {status}</div>
+            <div><b>Game:</b> {game_index}</div>
+            <div><b>Seed:</b> {seed}</div>
+            <div><b>Step:</b> {step}</div>
+            <div><b>Score:</b> {score}</div>
+            <div><b>Max tile:</b> {max_tile}</div>
+            <div><b>Last action:</b> {action}</div>
+        </div>
+        {board_html}
+    </div>
+    """
+
+
+def render_finished_games_table_html(finished_games, finished_limit=12):
+    recent_finished = finished_games[-finished_limit:]
+
+    if not recent_finished:
+        return """
+        <div style="margin-top:14px;color:#777;font-family:Arial,sans-serif;">
+            No finished games yet.
+        </div>
+        """
+
+    rows_html = "".join(
+        f"""
+        <tr>
+            <td style="padding:6px 8px;border-bottom:1px solid #eee;">{g['finish_order']}</td>
+            <td style="padding:6px 8px;border-bottom:1px solid #eee;">{g['game_index']}</td>
+            <td style="padding:6px 8px;border-bottom:1px solid #eee;">{g['seed']}</td>
+            <td style="padding:6px 8px;border-bottom:1px solid #eee;">{g['final_score']}</td>
+            <td style="padding:6px 8px;border-bottom:1px solid #eee;">{g['max_tile']}</td>
+            <td style="padding:6px 8px;border-bottom:1px solid #eee;">{g['move_count']}</td>
+            <td style="padding:6px 8px;border-bottom:1px solid #eee;">{g['duration_sec']:.2f}s</td>
+            <td style="padding:6px 8px;border-bottom:1px solid #eee;">{g['won']}</td>
+        </tr>
+        """
+        for g in recent_finished
+    )
+
+    return f"""
+    <div style="margin-top:14px;">
+        <div style="font-size:15px;margin-bottom:8px;">
+            <b>Finished games</b> (latest {len(recent_finished)})
+        </div>
+        <div style="overflow-x:auto;">
+            <table style="border-collapse:collapse;font-family:Arial,sans-serif;font-size:13px;min-width:760px;">
+                <thead>
+                    <tr style="background:#f5f5f5;">
+                        <th style="padding:6px 8px;text-align:left;">Finish #</th>
+                        <th style="padding:6px 8px;text-align:left;">Game</th>
+                        <th style="padding:6px 8px;text-align:left;">Seed</th>
+                        <th style="padding:6px 8px;text-align:left;">Score</th>
+                        <th style="padding:6px 8px;text-align:left;">Max tile</th>
+                        <th style="padding:6px 8px;text-align:left;">Moves</th>
+                        <th style="padding:6px 8px;text-align:left;">Time</th>
+                        <th style="padding:6px 8px;text-align:left;">Won</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {rows_html}
+                </tbody>
+            </table>
+        </div>
+    </div>
+    """
+
+
+def render_summary_text_html(finished_games, total_games):
+    if not finished_games:
+        text = f"{int(total_games)}-game summary (completed 0/{int(total_games)}):\nNo finished games yet."
+    else:
+        running_summary = summarize_games(finished_games)
+        text = _summary_display_text(running_summary, target_games=total_games)
+
+    return f"""
+    <div style="
+        margin-top:14px;
+        font-family:Consolas,Menlo,monospace;
+        font-size:13px;
+        white-space:pre-wrap;
+        border:1px solid #ddd;
+        border-radius:8px;
+        padding:12px;
+        background:#fafafa;
+    ">{text}</div>
+    """
+
+
+def render_live_monitor_html(
+    slot_states,
+    completed_games,
+    total_games,
+    avg_game_sec,
+    finished_games,
+    show_boards=True,
+    live_results_mode="none",
+    finished_limit=12,
+):
+    parts = []
+
+    if show_boards:
+        slots_html = "".join(
+            render_monitor_slot_html(i, slot_states[i])
+            for i in range(len(slot_states))
+        )
+
+        percent = 100.0 * completed_games / total_games if total_games else 0.0
+
+        parts.append(
+            f"""
+            <div style="font-size:15px;margin-bottom:10px;">
+                <b>Completed:</b> {completed_games}/{total_games}
+                &nbsp;|&nbsp;
+                <b>Percent:</b> {percent:.2f}%
+                &nbsp;|&nbsp;
+                <b>Avg completed game time:</b> {avg_game_sec:.2f}s
+            </div>
+            <div style="
+                display:grid;
+                grid-template-columns:repeat(2, minmax(320px, 1fr));
+                gap:12px;
+            ">
+                {slots_html}
+            </div>
+            """
+        )
+
+    if live_results_mode == "table_and_summary":
+        parts.append(render_summary_text_html(finished_games, total_games))
+        parts.append(render_finished_games_table_html(finished_games, finished_limit=finished_limit))
+    elif live_results_mode == "summary_only":
+        parts.append(render_summary_text_html(finished_games, total_games))
+
+    if not parts:
+        percent = 100.0 * completed_games / total_games if total_games else 0.0
+        parts.append(
+            f"""
+            <div style="font-size:15px;margin-bottom:10px;">
+                <b>Completed:</b> {completed_games}/{total_games}
+                &nbsp;|&nbsp;
+                <b>Percent:</b> {percent:.2f}%
+                &nbsp;|&nbsp;
+                <b>Avg completed game time:</b> {avg_game_sec:.2f}s
+            </div>
+            """
+        )
+
+    return f"""
+    <div style="margin-bottom:10px;font-family:Arial,sans-serif;">
+        {''.join(parts)}
+    </div>
+    """
+
+# -------------------------------------------------------------------
+# Plain live results output
+# -------------------------------------------------------------------
+
+def finished_games_df(finished_games, finished_limit=12):
+    recent_finished = finished_games[-finished_limit:]
+    if not recent_finished:
+        return pd.DataFrame(columns=[
+            "Finish #", "Game", "Seed", "Score", "Max tile", "Moves", "Time", "Won"
+        ])
+
+    return pd.DataFrame([
+        {
+            "Finish #": g["finish_order"],
+            "Game": g["game_index"],
+            "Seed": g["seed"],
+            "Score": g["final_score"],
+            "Max tile": g["max_tile"],
+            "Moves": g["move_count"],
+            "Time": f"{g['duration_sec']:.2f}s",
+            "Won": g["won"],
+        }
+        for g in recent_finished
+    ])
+
+
+def display_live_results_plain(finished_games, total_games, live_results_mode, finished_limit=12):
+    if live_results_mode == "none":
+        return
+
+    if not finished_games:
+        print(f"{int(total_games)}-game summary (completed 0/{int(total_games)}):")
+        print("No finished games yet.")
+        return
+
+    running_summary = summarize_games(finished_games)
+    print(_summary_display_text(running_summary, target_games=total_games))
+
+    if live_results_mode == "table_and_summary":
+        df = finished_games_df(finished_games, finished_limit=finished_limit)
+        print(f"\nFinished games (latest {len(df)}):")
+        display(df)
+
+# -------------------------------------------------------------------
+# Live monitor
+# -------------------------------------------------------------------
+
+class LiveGameMonitor:
+    """
+    Shows:
+    - optional 4 stable CPU slots
+    - optional live finished-game results
+
+    show_boards controls CPU board display.
+    live_results_mode controls results display independently:
+    - "none"
+    - "table_and_summary"
+    - "summary_only"
+    """
+
+    def __init__(
+        self,
+        event_queue=None,
+        n_slots=4,
+        refresh_seconds=DEFAULT_MONITOR_REFRESH_SECONDS,
+        show_boards=True,
+        live_results_mode="none",
+        finished_limit=12,
+    ):
+        self.event_queue = event_queue
+        self.n_slots = n_slots
+        self.refresh_seconds = refresh_seconds
+        self.show_boards = show_boards
+        self.live_results_mode = live_results_mode
+        self.finished_limit = finished_limit
+
+        self.output = widgets.Output()
+        self.slot_states = [None] * n_slots
+        self.pid_to_slot = {}
+
+        self.completed_games = 0
+        self.total_games = 0
+        self.avg_game_sec = 0.0
+        self.finished_games = []
+
+        self._stop_event = threading.Event()
+        self._thread = None
+        self._last_render_time = 0.0
+
+    def start(self, total_games):
+        self.total_games = total_games
+        display(self.output)
+        self._render(force=True)
+
+        if self.show_boards and self.event_queue is not None:
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+
+    def stop(self):
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+        self._render(force=True)
+
+    def update_progress(self, completed_games, avg_game_sec):
+        self.completed_games = completed_games
+        self.avg_game_sec = avg_game_sec
+
+    def add_finished_game(self, result):
+        self.finished_games.append({
+            "finish_order": len(self.finished_games) + 1,
+            "game_index": result["game_index"],
+            "seed": result["seed"],
+            "final_score": result["final_score"],
+            "max_tile": result["max_tile"],
+            "move_count": result["move_count"],
+            "duration_sec": result["duration_sec"],
+            "won": result["won"],
+        })
+
+    def _assign_slot(self, pid):
+        if pid in self.pid_to_slot:
+            return self.pid_to_slot[pid]
+
+        used = set(self.pid_to_slot.values())
+        for slot in range(self.n_slots):
+            if slot not in used:
+                self.pid_to_slot[pid] = slot
+                return slot
+
+        slot = len(self.pid_to_slot) % self.n_slots
+        self.pid_to_slot[pid] = slot
+        return slot
+
+    def _handle_event(self, event):
+        pid = event["pid"]
+        slot = self._assign_slot(pid)
+        self.slot_states[slot] = event
+
+    def _render(self, force=False):
+        now = time.time()
+        if not force and (now - self._last_render_time) < self.refresh_seconds:
+            return
+
+        with self.output:
+            clear_output(wait=True)
+
+            if self.show_boards:
+                html = render_live_monitor_html(
+                    self.slot_states,
+                    self.completed_games,
+                    self.total_games,
+                    self.avg_game_sec,
+                    self.finished_games,
+                    show_boards=self.show_boards,
+                    live_results_mode=self.live_results_mode,
+                    finished_limit=self.finished_limit,
+                )
+                display(HTML(html))
+            else:
+                display_live_results_plain(
+                    finished_games=self.finished_games,
+                    total_games=self.total_games,
+                    live_results_mode=self.live_results_mode,
+                    finished_limit=self.finished_limit,
+                )
+
+        self._last_render_time = now
+
+    def _run(self):
+        while not self._stop_event.is_set():
+            try:
+                event = self.event_queue.get(timeout=0.1)
+                self._handle_event(event)
+                self._render(force=False)
+            except queue.Empty:
+                self._render(force=False)
+                continue
+
+# -------------------------------------------------------------------
+# Game worker
+# -------------------------------------------------------------------
+
+def play_one_game_bitboard(
+    agent_fn,
+    seed=None,
+    game_index=None,
+    max_steps=MAX_STEPS,
+    snapshot_every_steps=DEFAULT_SNAPSHOT_EVERY_STEPS,
+    monitor_queue=None,
+    collect_frames=False,
+):
+    """
+    Play one full game using a bitboard-based agent.
+    The agent must have signature: agent_fn(bitboard, legal_moves, rng)
+
+    This version avoids:
+    - board conversion on every step
+    - legal-move recompute inside env info
+    """
+    rng = random.Random(seed)
+    env = Game2048Env(rng=rng)
+
+    # Keep this reset to preserve the old seed-to-game mapping used by your current notebook.
+    # If you do not care about exact continuity with past runs, removing this line is slightly faster.
+    env.reset()
+
+    start_time = time.perf_counter()
+
+    frames = None
+    if collect_frames:
+        frames = [{
+            "step": 0,
+            "action": None,
+            "reward": 0,
+            "score": env.get_score(),
+            "max_tile": get_max_tile_fast(env.board),
+            "bitboard": env.board,
+        }]
+
+    if monitor_queue is not None:
+        monitor_queue.put({
+            "pid": os.getpid(),
+            "status": "running",
+            "game_index": game_index,
+            "seed": seed,
+            "step": 0,
+            "score": env.get_score(),
+            "max_tile": get_max_tile_fast(env.board),
+            "action": None,
+            "bitboard": env.board,
+        })
+
+    while not env.done and env.get_move_count() < max_steps:
+        bitboard = env.board
+        legal_moves = env.get_legal_moves()
+
+        action = agent_fn(bitboard, legal_moves, rng)
+        if action not in legal_moves:
+            raise ValueError(
+                f"Agent returned illegal move '{action}' for legal moves {legal_moves}"
+            )
+
+        _, reward, done, info = env.step_bitboard(action, include_legal_moves=False)
+
+        if collect_frames:
+            frames.append({
+                "step": info["move_count"],
+                "action": action,
+                "reward": reward,
+                "score": info["score"],
+                "max_tile": info["max_tile"],
+                "bitboard": env.board,
+            })
+
+        if (
+            monitor_queue is not None
+            and snapshot_every_steps is not None
+            and snapshot_every_steps > 0
+            and info["move_count"] % snapshot_every_steps == 0
+        ):
+            monitor_queue.put({
+                "pid": os.getpid(),
+                "status": "running",
+                "game_index": game_index,
+                "seed": seed,
+                "step": info["move_count"],
+                "score": info["score"],
+                "max_tile": info["max_tile"],
+                "action": action,
+                "bitboard": env.board,
+            })
+
+    duration_sec = time.perf_counter() - start_time
+
+    result = {
+        "game_index": game_index,
+        "seed": seed,
+        "final_score": env.get_score(),
+        "max_tile": get_max_tile_fast(env.board),
+        "move_count": env.get_move_count(),
+        "won": env.won,
+        "duration_sec": duration_sec,
+    }
+
+    if collect_frames:
+        result["frames"] = frames
+
+    if monitor_queue is not None:
+        monitor_queue.put({
+            "pid": os.getpid(),
+            "status": "done",
+            "game_index": game_index,
+            "seed": seed,
+            "step": env.get_move_count(),
+            "score": env.get_score(),
+            "max_tile": get_max_tile_fast(env.board),
+            "action": frames[-1]["action"] if collect_frames and frames else None,
+            "bitboard": env.board,
+        })
+
+    return result
+
+
+
+# -------------------------------------------------------------------
+# Experiment run/load helpers
+# -------------------------------------------------------------------
+
+def run_experiment(
+    name,
+    agent_fn,
+    n_games=100,
+    base_seed=BASE_SEED,
+    max_steps=MAX_STEPS,
+    snapshot_every_steps=DEFAULT_SNAPSHOT_EVERY_STEPS,
+    show_live=True,
+    live_results_mode="none",   # "none", "table_and_summary", "summary_only"
+    finished_limit=12,
+    save_replays=False,
+    force=False,
+):
+    """
+    Run or load an experiment.
+
+    Always saves:
+    - summary.json
+    - games.json.gz
+    - games_table.csv
+
+    Saves replays.json.gz only if save_replays=True.
+    """
+    if live_results_mode not in {"none", "table_and_summary", "summary_only"}:
+        raise ValueError("live_results_mode must be one of: 'none', 'table_and_summary', 'summary_only'.")
+
+    cache_key = artifact_cache_key(name, n_games, base_seed, max_steps)
+    paths = artifact_rel_paths(name, n_games, base_seed, max_steps)
+
+    if cache_key in EXPERIMENT_MEMORY_CACHE and not force:
+        cached = EXPERIMENT_MEMORY_CACHE[cache_key]
+        if save_replays and "replays" not in cached:
+            pass
+        else:
+            print(f"[MEMORY] {name} loaded from in-session cache")
+            return cached
+
+    summary_exists = artifact_read_path(paths["summary"]) is not None
+    games_exists = artifact_read_path(paths["games"]) is not None
+    replays_exists = artifact_read_path(paths["replays"]) is not None
+
+    can_load_from_artifacts = (
+        summary_exists and games_exists and (replays_exists or not save_replays)
+    )
+
+    if can_load_from_artifacts and not force:
+        print(f"[LOAD] {name} from artifact cache")
+
+        artifact = {
+            "name": normalize_experiment_name(name),
+            "n_games": n_games,
+            "base_seed": base_seed,
+            "max_steps": max_steps,
+            "summary": _normalize_loaded_summary(load_json(paths["summary"], compress=False)),
+            "games_data": load_json(paths["games"], compress=True),
+            "games_table_csv": games_table_rel_path(name, n_games, base_seed, max_steps),
+        }
+
+        if save_replays and replays_exists:
+            artifact["replays"] = load_json(paths["replays"], compress=True)
+
+        EXPERIMENT_MEMORY_CACHE[cache_key] = artifact
+        return artifact
+
+    seeds = [base_seed + i for i in range(n_games)]
+
+    monitor_queue = None
+    monitor = None
+    manager = None
+
+    should_show_any_live_output = show_live or (live_results_mode != "none")
+
+    if should_show_any_live_output:
+        if show_live:
+            manager = Manager()
+            monitor_queue = manager.Queue()
+
+        monitor = LiveGameMonitor(
+            event_queue=monitor_queue,
+            n_slots=N_JOBS,
+            refresh_seconds=DEFAULT_MONITOR_REFRESH_SECONDS,
+            show_boards=show_live,
+            live_results_mode=live_results_mode,
+            finished_limit=finished_limit,
+        )
+        monitor.start(total_games=n_games)
+
+    results = []
+    total_time = 0.0
+    completed_games = 0
+
+    parallel = Parallel(
+        n_jobs=N_JOBS,
+        prefer="processes",
+        return_as="generator_unordered",
+    )
+
+    try:
+        with tqdm(total=n_games, desc=f"Evaluating {name}") as pbar:
+            for result in parallel(
+                delayed(play_one_game_bitboard)(
+                    agent_fn=agent_fn,
+                    seed=seed,
+                    game_index=i + 1,
+                    max_steps=max_steps,
+                    snapshot_every_steps=snapshot_every_steps,
+                    monitor_queue=monitor_queue,
+                    collect_frames=save_replays,
+                )
+                for i, seed in enumerate(seeds)
+            ):
+                results.append(result)
+
+                completed_games += 1
+                total_time += result["duration_sec"]
+                avg_game_sec = total_time / completed_games
+
+                pbar.update(1)
+                pbar.set_postfix(avg_game_s=f"{avg_game_sec:.2f}")
+
+                if monitor is not None:
+                    monitor.update_progress(completed_games, avg_game_sec)
+                    monitor.add_finished_game(result)
+                    monitor._render(force=True)
+
+    finally:
+        if monitor is not None:
+            monitor.stop()
+
+    results.sort(key=lambda x: x["game_index"])
+
+    if save_replays:
+        replays = results
+        games_data = [strip_frames_from_replay(x) for x in replays]
+    else:
+        replays = None
+        games_data = results
+
+    summary = summarize_games(games_data)
+
+    save_json(summary, paths["summary"], compress=False)
+    save_json(games_data, paths["games"], compress=True)
+    save_games_table_csv(games_data, name, n_games, base_seed, max_steps)
+
+    if save_replays:
+        save_json(replays, paths["replays"], compress=True)
+
+    artifact = {
+        "name": normalize_experiment_name(name),
+        "n_games": n_games,
+        "base_seed": base_seed,
+        "max_steps": max_steps,
+        "summary": summary,
+        "games_data": games_data,
+        "games_table_csv": games_table_rel_path(name, n_games, base_seed, max_steps),
+    }
+
+    if save_replays:
+        artifact["replays"] = replays
+
+    EXPERIMENT_MEMORY_CACHE[cache_key] = artifact
+    return artifact
+
+
+def load_experiment(
+    name,
+    n_games=100,
+    base_seed=BASE_SEED,
+    max_steps=MAX_STEPS,
+    load_replays=True,
+):
+    """
+    Load a previously saved experiment from memory or artifacts.
+    """
+    cache_key = artifact_cache_key(name, n_games, base_seed, max_steps)
+
+    if cache_key in EXPERIMENT_MEMORY_CACHE:
+        artifact = EXPERIMENT_MEMORY_CACHE[cache_key]
+        if load_replays:
+            return artifact
+        return {k: v for k, v in artifact.items() if k != "replays"}
+
+    paths = artifact_rel_paths(name, n_games, base_seed, max_steps)
+
+    artifact = {
+        "name": normalize_experiment_name(name),
+        "n_games": n_games,
+        "base_seed": base_seed,
+        "max_steps": max_steps,
+        "summary": _normalize_loaded_summary(load_json(paths["summary"], compress=False)),
+        "games_data": load_json(paths["games"], compress=True),
+        "games_table_csv": games_table_rel_path(name, n_games, base_seed, max_steps),
+    }
+
+    if load_replays and artifact_read_path(paths["replays"]) is not None:
+        artifact["replays"] = load_json(paths["replays"], compress=True)
+
+    EXPERIMENT_MEMORY_CACHE[cache_key] = artifact
+    return artifact
+
+# -------------------------------------------------------------------
+# Replay selection helpers
+# -------------------------------------------------------------------
+
+def select_replay_record(replays, target_tile=None, mode="best", rank=1):
+    if not replays:
+        return None
+
+    if target_tile is None:
+        target_tile = max(r["max_tile"] for r in replays)
+
+    candidates = [r for r in replays if r["max_tile"] == target_tile]
+    if not candidates:
+        return None
+
+    if mode not in {"best", "worst"}:
+        raise ValueError("mode must be 'best' or 'worst'.")
+
+    reverse = (mode == "best")
+    candidates = sorted(
+        candidates,
+        key=lambda r: (r["final_score"], r["move_count"], r["seed"]),
+        reverse=reverse,
+    )
+
+    if rank < 1 or rank > len(candidates):
+        raise ValueError(f"rank must be between 1 and {len(candidates)} for target_tile={target_tile}")
+
+    return candidates[rank - 1]
+
+
+def replay_candidates_df(replays, target_tile=None, mode="best"):
+    if not replays:
+        return pd.DataFrame()
+
+    if target_tile is None:
+        target_tile = max(r["max_tile"] for r in replays)
+
+    candidates = [r for r in replays if r["max_tile"] == target_tile]
+    reverse = (mode == "best")
+
+    candidates = sorted(
+        candidates,
+        key=lambda r: (r["final_score"], r["move_count"], r["seed"]),
+        reverse=reverse,
+    )
+
+    rows = []
+    for i, r in enumerate(candidates, start=1):
+        rows.append({
+            "rank": i,
+            "game_index": r["game_index"],
+            "seed": r["seed"],
+            "final_score": r["final_score"],
+            "max_tile": r["max_tile"],
+            "move_count": r["move_count"],
+            "duration_sec": r["duration_sec"],
+            "won": r["won"],
+        })
+
+    return pd.DataFrame(rows)
+
+# -------------------------------------------------------------------
+# Replay viewer
+# -------------------------------------------------------------------
+
+def show_replay_buttons(replay):
+    frames = replay["frames"]
+    current_idx = 0
+
+    header = widgets.HTML()
+    board_widget = widgets.HTML()
+
+    def clamp_index(idx):
+        return max(0, min(len(frames) - 1, idx))
+
+    def render_frame(idx):
+        nonlocal current_idx
+        current_idx = clamp_index(idx)
+
+        frame = frames[current_idx]
+        board_html = render_board_html_from_bitboard(frame["bitboard"])
+
+        header.value = (
+            f"<b>Seed:</b> {replay['seed']} | "
+            f"<b>Frame:</b> {current_idx + 1}/{len(frames)} | "
+            f"<b>Step:</b> {frame['step']} | "
+            f"<b>Action:</b> {frame['action']} | "
+            f"<b>Reward:</b> {frame['reward']} | "
+            f"<b>Score:</b> {frame['score']} | "
+            f"<b>Max tile:</b> {frame['max_tile']}"
+        )
+
+        board_widget.value = board_html
+
+    def make_button(text, delta):
+        button = widgets.Button(description=text)
+        button.on_click(lambda _: render_frame(current_idx + delta))
+        return button
+
+    btn_first = widgets.Button(description="First")
+    btn_last = widgets.Button(description="Last")
+    btn_m100 = make_button("-100", -100)
+    btn_m10 = make_button("-10", -10)
+    btn_prev = make_button("Prev", -1)
+    btn_next = make_button("Next", 1)
+    btn_p10 = make_button("+10", 10)
+    btn_p100 = make_button("+100", 100)
+
+    btn_first.on_click(lambda _: render_frame(0))
+    btn_last.on_click(lambda _: render_frame(len(frames) - 1))
+
+    controls = widgets.HBox([btn_first, btn_m100, btn_m10, btn_prev, btn_next, btn_p10, btn_p100, btn_last])
+
+    display(header)
+    display(controls)
+    display(board_widget)
+
+    render_frame(0)
+
+
+def show_saved_replay(
+    name,
+    n_games=100,
+    base_seed=BASE_SEED,
+    max_steps=MAX_STEPS,
+    target_tile=None,
+    mode="best",
+    rank=1,
+    show_table=False,
+):
+    artifact = load_experiment(
+        name=name,
+        n_games=n_games,
+        base_seed=base_seed,
+        max_steps=max_steps,
+        load_replays=True,
+    )
+
+    if "replays" not in artifact:
+        print("No saved replays found for this experiment. Re-run it with save_replays=True.")
+        return None
+
+    replays = artifact["replays"]
+
+    if show_table:
+        display(replay_candidates_df(replays, target_tile=target_tile, mode=mode))
+
+    replay = select_replay_record(
+        replays=replays,
+        target_tile=target_tile,
+        mode=mode,
+        rank=rank,
+    )
+
+    if replay is None:
+        print("No matching replay found.")
+        return None
+
+    print({
+        "selected_game_index": replay["game_index"],
+        "selected_seed": replay["seed"],
+        "selected_score": replay["final_score"],
+        "selected_max_tile": replay["max_tile"],
+        "selected_move_count": replay["move_count"],
+        "selected_duration_sec": replay["duration_sec"],
+        "mode": mode,
+        "rank": rank,
+    })
+
+    show_replay_buttons(replay)
+    return replay
+
+
+def rebuild_replay(
+    name,
+    agent_fn,
+    n_games=100,
+    base_seed=BASE_SEED,
+    max_steps=MAX_STEPS,
+    target_tile=None,
+    mode="best",
+    rank=1,
+    show_table=False,
+    save_replay=True,
+    return_replay=False,
+):
+    """
+    Rebuild one replay from a saved summary-only experiment.
+    """
+    artifact = load_experiment(
+        name=name,
+        n_games=n_games,
+        base_seed=base_seed,
+        max_steps=max_steps,
+        load_replays=False,
+    )
+
+    games_data = artifact["games_data"]
+    if not games_data:
+        print("No saved games_data found.")
+        return None
+
+    if target_tile is None:
+        target_tile = max(g["max_tile"] for g in games_data)
+
+    candidates = [g for g in games_data if g["max_tile"] == target_tile]
+    if not candidates:
+        print(f"No games found with max_tile == {target_tile}.")
+        return None
+
+    if mode not in {"best", "worst"}:
+        raise ValueError("mode must be 'best' or 'worst'.")
+
+    reverse = (mode == "best")
+    candidates = sorted(
+        candidates,
+        key=lambda g: (g["final_score"], g["move_count"], g["seed"]),
+        reverse=reverse,
+    )
+
+    if rank < 1 or rank > len(candidates):
+        raise ValueError(f"rank must be between 1 and {len(candidates)}.")
+
+    if show_table:
+        display(pd.DataFrame([
+            {
+                "rank": i + 1,
+                "game_index": g["game_index"],
+                "seed": g["seed"],
+                "final_score": g["final_score"],
+                "max_tile": g["max_tile"],
+                "move_count": g["move_count"],
+                "duration_sec": g["duration_sec"],
+                "won": g["won"],
+            }
+            for i, g in enumerate(candidates)
+        ]))
+
+    selected = candidates[rank - 1]
+
+    replay = play_one_game_bitboard(
+        agent_fn=agent_fn,
+        seed=selected["seed"],
+        game_index=selected["game_index"],
+        max_steps=max_steps,
+        snapshot_every_steps=None,
+        monitor_queue=None,
+        collect_frames=True,
+    )
+
+    if save_replay:
+        paths = artifact_rel_paths(name, n_games, base_seed, max_steps)
+        existing = None
+
+        if artifact_read_path(paths["replays"]) is not None:
+            existing = load_json(paths["replays"], compress=True)
+
+        if existing is None:
+            existing = []
+
+        existing = [r for r in existing if r["seed"] != replay["seed"]]
+        existing.append(replay)
+        existing.sort(key=lambda x: x["game_index"])
+
+        save_json(existing, paths["replays"], compress=True)
+
+    print({
+        "selected_game_index": selected["game_index"],
+        "selected_seed": selected["seed"],
+        "selected_score": selected["final_score"],
+        "selected_max_tile": selected["max_tile"],
+        "selected_move_count": selected["move_count"],
+        "mode": mode,
+        "rank": rank,
+    })
+
+    show_replay_buttons(replay)
+
+    if return_replay:
+        return replay
+
+    return None
+
+
+# Hot-path internal helpers
+# Keep public helpers unchanged; these are for fast runtime paths only.
+
+def get_max_tile_fast(bitboard: BitBoard) -> int:
+    max_exp = 0
+    for idx in range(16):
+        exp = (bitboard >> (4 * idx)) & 0xF
+        if exp > max_exp:
+            max_exp = exp
+    return 0 if max_exp == 0 else (1 << max_exp)
+
+
+def spawn_random_tile_bitboard_fast(bitboard: BitBoard, rng: Optional[random.Random] = None) -> BitBoard:
+    """
+    Same logic as spawn_random_tile_bitboard, but:
+    - no repeated validation
+    - no empty-position list allocation
+    """
+    rng = rng or random
+
+    empty_count = 0
+    for idx in range(16):
+        if ((bitboard >> (4 * idx)) & 0xF) == 0:
+            empty_count += 1
+
+    if empty_count == 0:
+        return bitboard
+
+    target_empty = rng.randrange(empty_count)
+
+    chosen_idx = -1
+    for idx in range(16):
+        if ((bitboard >> (4 * idx)) & 0xF) == 0:
+            if target_empty == 0:
+                chosen_idx = idx
+                break
+            target_empty -= 1
+
+    exp = 1 if rng.random() < TWO_PROBABILITY else 2
+    shift = 4 * chosen_idx
+    return (bitboard & ~(0xF << shift)) | (exp << shift)
+
+
+def create_initial_bitboard_fast(rng: Optional[random.Random] = None) -> BitBoard:
+    rng = rng or random
+    bitboard = 0
+    bitboard = spawn_random_tile_bitboard_fast(bitboard, rng)
+    bitboard = spawn_random_tile_bitboard_fast(bitboard, rng)
+    return bitboard

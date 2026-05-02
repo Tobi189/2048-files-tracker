@@ -1,0 +1,23 @@
+# This cell defines the random agent and loads or computes its 100-game artifact bundle.
+# Full move-by-move replays are also saved for 100 games so they are available after notebook reload.
+
+def random_agent(board, legal_moves, rng=None):
+    """
+    Choose a legal move uniformly at random.
+    """
+    rng = rng or random
+    return rng.choice(legal_moves)
+
+# RANDOM_GAMES controls how many games are used for this experiment section.
+RANDOM_GAMES = 100
+
+random_artifact_100 = run_experiment_cached(
+    name="random",
+    agent_fn=random_agent,
+    n_games=RANDOM_GAMES,
+    base_seed=BASE_SEED,
+    save_replays=SAVE_REPLAYS_FOR_100,
+    force=False,
+)
+
+random_artifact_100["summary"]

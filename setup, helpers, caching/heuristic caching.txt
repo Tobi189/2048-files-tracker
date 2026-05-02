@@ -1,0 +1,200 @@
+# Heuristic row cache for simple expectimax-style models
+
+SIMPLE_HEURISTIC_CACHE_VERSION = "v1"
+SIMPLE_HEURISTIC_CACHE_REL_PATH = os.path.join(
+    "engine", f"simple_heuristic_row_cache_{SIMPLE_HEURISTIC_CACHE_VERSION}.pkl.gz"
+)
+
+
+def _heuristic_cache_read_path(rel_path):
+    candidate = os.path.join(ARTIFACT_WRITE_ROOT, rel_path)
+    if os.path.exists(candidate):
+        return candidate
+
+    marker = f"/{ARTIFACT_ROOT_NAME}/"
+    for dirname, _, filenames in os.walk("/kaggle/input"):
+        if marker not in dirname:
+            continue
+
+        relative_dir = dirname.split(marker, 1)[1]
+        for filename in filenames:
+            maybe_rel = os.path.join(relative_dir, filename) if relative_dir else filename
+            if maybe_rel == rel_path:
+                return os.path.join(dirname, filename)
+
+    return None
+
+
+def _heuristic_cache_write_path(rel_path):
+    path = os.path.join(ARTIFACT_WRITE_ROOT, rel_path)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    return path
+
+
+def _row_empty_count(row16):
+    count = 0
+    for i in range(4):
+        if ((row16 >> (4 * i)) & 0xF) == 0:
+            count += 1
+    return count
+
+
+def _row_merge_potential(row16):
+    vals = [(row16 >> (4 * i)) & 0xF for i in range(4)]
+    score = 0.0
+
+    for i in range(3):
+        a = vals[i]
+        b = vals[i + 1]
+        if a > 0 and b > 0:
+            if a == b:
+                score += 1.0
+            elif abs(a - b) == 1:
+                score += 0.35
+
+    return score
+
+
+def _row_monotonicity(row16):
+    vals = [(row16 >> (4 * i)) & 0xF for i in range(4)]
+    score = 0.0
+
+    for i in range(3):
+        delta = vals[i] - vals[i + 1]
+        if delta >= 0:
+            score += delta + 1.0
+        else:
+            score += 3.0 * delta
+
+    return score
+
+
+def _row_smoothness(row16):
+    vals = [(row16 >> (4 * i)) & 0xF for i in range(4)]
+    score = 0.0
+
+    for i in range(3):
+        a = vals[i]
+        b = vals[i + 1]
+        if a > 0 and b > 0:
+            score -= abs(a - b)
+
+    return score
+
+
+def _row_nonzero_sum(row16):
+    total = 0
+    for i in range(4):
+        total += (row16 >> (4 * i)) & 0xF
+    return total
+
+
+def _build_simple_heuristic_row_cache():
+    row_empty = [0] * 65536
+    row_merge = [0.0] * 65536
+    row_mono = [0.0] * 65536
+    row_smooth = [0.0] * 65536
+    row_sum = [0] * 65536
+    row_total_score = [0.0] * 65536
+
+    # simple, intuitive weights
+    W_EMPTY = 28.0
+    W_MERGE = 20.0
+    W_MONO = 12.0
+    W_SMOOTH = 4.0
+    W_SUM = -1.0
+
+    for row16 in range(65536):
+        empty_term = _row_empty_count(row16)
+        merge_term = _row_merge_potential(row16)
+        mono_term = _row_monotonicity(row16)
+        smooth_term = _row_smoothness(row16)
+        sum_term = _row_nonzero_sum(row16)
+
+        row_empty[row16] = empty_term
+        row_merge[row16] = merge_term
+        row_mono[row16] = mono_term
+        row_smooth[row16] = smooth_term
+        row_sum[row16] = sum_term
+
+        row_total_score[row16] = (
+            W_EMPTY * empty_term +
+            W_MERGE * merge_term +
+            W_MONO * mono_term +
+            W_SMOOTH * smooth_term +
+            W_SUM * sum_term
+        )
+
+    return {
+        "row_empty": row_empty,
+        "row_merge": row_merge,
+        "row_mono": row_mono,
+        "row_smooth": row_smooth,
+        "row_sum": row_sum,
+        "row_total_score": row_total_score,
+    }
+
+
+def load_or_build_simple_heuristic_row_cache(force_rebuild=False):
+    cache_path = None if force_rebuild else _heuristic_cache_read_path(SIMPLE_HEURISTIC_CACHE_REL_PATH)
+
+    if cache_path is not None:
+        with gzip.open(cache_path, "rb") as f:
+            cache = pickle.load(f)
+        print(f"[LOAD] simple heuristic row cache from {cache_path}")
+        return cache
+
+    cache = _build_simple_heuristic_row_cache()
+    cache_path = _heuristic_cache_write_path(SIMPLE_HEURISTIC_CACHE_REL_PATH)
+
+    with gzip.open(cache_path, "wb") as f:
+        pickle.dump(cache, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+    print(f"[SAVE] simple heuristic row cache to {cache_path}")
+    return cache
+
+
+SIMPLE_HEURISTIC_ROW_CACHE = load_or_build_simple_heuristic_row_cache(force_rebuild=False)
+ROW_TOTAL_SCORE = SIMPLE_HEURISTIC_ROW_CACHE["row_total_score"]
+
+
+def corner_anchor_bonus(bitboard):
+    """
+    Light, intuitive corner term:
+    prefer max tile in bottom-right corner.
+    """
+    max_log = 0
+    for i in range(16):
+        v = (bitboard >> (4 * i)) & 0xF
+        if v > max_log:
+            max_log = v
+
+    corner = (bitboard >> (4 * 15)) & 0xF
+    bonus = 0.0
+
+    if corner == max_log and max_log > 0:
+        bonus += 40.0
+
+    bonus += 4.0 * ((bitboard >> (4 * 14)) & 0xF)
+    bonus += 4.0 * ((bitboard >> (4 * 11)) & 0xF)
+
+    return bonus
+
+
+def evaluate_board_fast(bitboard):
+    score = 0.0
+
+    for row_idx in range(4):
+        row16 = (bitboard >> (16 * row_idx)) & ROW_MASK_16
+        score += ROW_TOTAL_SCORE[row16]
+
+    transposed = _transpose_bitboard_fast(bitboard)
+    for row_idx in range(4):
+        row16 = (transposed >> (16 * row_idx)) & ROW_MASK_16
+        score += ROW_TOTAL_SCORE[row16]
+
+    score += corner_anchor_bonus(bitboard)
+    return score
+
+
+print("[READY] simple cached heuristic loaded")

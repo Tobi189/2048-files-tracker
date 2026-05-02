@@ -1,0 +1,446 @@
+CONVERSION_AWARE_EXPECTIMAX = "conversion_aware_expectimax"
+
+SECM_V1_REWARD_WEIGHT = 2.2
+SECM_V1_AFTERSTATE_WEIGHT = 0.18
+SECM_V1_BASE_PROBABILITY_CUTOFF = 0.01
+SECM_V1_MAX_DEPTH = 4
+
+
+# ------------------------------------------------------------
+# Small helpers
+# ------------------------------------------------------------
+
+def cell_log_secm_v1(bitboard, idx):
+    return (bitboard >> (4 * idx)) & 0xF
+
+
+def idx_row_secm_v1(idx):
+    return idx >> 2
+
+
+def idx_col_secm_v1(idx):
+    return idx & 3
+
+
+def manhattan_secm_v1(a, b):
+    return abs(idx_row_secm_v1(a) - idx_row_secm_v1(b)) + abs(idx_col_secm_v1(a) - idx_col_secm_v1(b))
+
+
+def anchor_region_distance_secm_v1(idx):
+    best = 99
+    for target in (15, 14, 11, 10):
+        d = manhattan_secm_v1(idx, target)
+        if d < best:
+            best = d
+    return best
+
+
+# ------------------------------------------------------------
+# Board info cache
+# ------------------------------------------------------------
+
+def board_info_secm_v1(bitboard, info_cache):
+    cached = info_cache.get(bitboard)
+    if cached is not None:
+        return cached
+
+    empties = 0
+    mask = 0
+
+    max1 = -1
+    pos1 = -1
+    max2 = -1
+    pos2 = -1
+
+    for idx in range(16):
+        v = (bitboard >> (4 * idx)) & 0xF
+
+        if v == 0:
+            empties += 1
+        else:
+            mask |= 1 << v
+
+        if v > max1:
+            max2 = max1
+            pos2 = pos1
+            max1 = v
+            pos1 = idx
+        elif v > max2:
+            max2 = v
+            pos2 = idx
+
+    unique_logs = mask.bit_count()
+
+    # conversion_mode_secm_v1 logic
+    if max1 < 10:
+        conversion_mode = False
+    elif max2 < max1 - 1:
+        conversion_mode = False
+    elif anchor_region_distance_secm_v1(pos1) <= 2 or anchor_region_distance_secm_v1(pos2) <= 2:
+        conversion_mode = True
+    elif empties <= 3:
+        conversion_mode = True
+    else:
+        conversion_mode = False
+
+    # reward_weight_secm_v1 logic
+    reward_weight = 1.6 if conversion_mode else SECM_V1_REWARD_WEIGHT
+
+    # probability_cutoff_secm_v1 logic
+    if not conversion_mode:
+        probability_cutoff = SECM_V1_BASE_PROBABILITY_CUTOFF
+    else:
+        if max1 >= 11 or empties <= 2:
+            probability_cutoff = 0.003
+        else:
+            probability_cutoff = 0.006
+
+    # internal_top_k_secm_v1 logic
+    if not conversion_mode:
+        internal_top_k = 2
+    else:
+        if max1 >= 11 or empties <= 2:
+            internal_top_k = 4
+        else:
+            internal_top_k = 3
+
+    # adaptive_depth_secm_v1 logic
+    if empties >= 6:
+        depth = 2
+    else:
+        depth = 3
+
+    if empties <= 2 and unique_logs <= 5:
+        depth = 3
+
+    if conversion_mode and max1 >= 11 and empties <= 3:
+        depth = 4
+
+    depth = min(depth, SECM_V1_MAX_DEPTH)
+
+    # conversion_bonus_secm_v1 logic
+    if max1 < 10:
+        conversion_bonus = 0.0
+    else:
+        conversion_bonus = 0.0
+
+        if max2 == max1:
+            conversion_bonus += 60.0
+        elif max2 == max1 - 1:
+            conversion_bonus += 28.0
+        else:
+            conversion_bonus -= 12.0 * (max1 - max2 - 1)
+
+        if pos1 >= 0 and pos2 >= 0:
+            d_pair = manhattan_secm_v1(pos1, pos2)
+            conversion_bonus += max(0.0, 12.0 - 4.0 * d_pair)
+
+        d1 = anchor_region_distance_secm_v1(pos1) if pos1 >= 0 else 99
+        d2 = anchor_region_distance_secm_v1(pos2) if pos2 >= 0 else 99
+
+        conversion_bonus += max(0.0, 10.0 - 3.0 * d1)
+        conversion_bonus += max(0.0, 8.0 - 2.0 * d2)
+
+        corner = (bitboard >> (4 * 15)) & 0xF
+        left_of_corner = (bitboard >> (4 * 14)) & 0xF
+        above_corner = (bitboard >> (4 * 11)) & 0xF
+        diag = (bitboard >> (4 * 10)) & 0xF
+
+        if corner == max1 and max1 > 0:
+            conversion_bonus += 24.0
+
+        conversion_bonus += 4.0 * left_of_corner
+        conversion_bonus += 4.0 * above_corner
+        conversion_bonus += 1.5 * diag
+
+        if left_of_corner > 0 and above_corner > 0:
+            if left_of_corner == above_corner:
+                conversion_bonus += 8.0
+            elif abs(left_of_corner - above_corner) == 1:
+                conversion_bonus += 3.0
+
+    info = {
+        "empties": empties,
+        "unique_logs": unique_logs,
+        "max1": max1,
+        "pos1": pos1,
+        "max2": max2,
+        "pos2": pos2,
+        "conversion_mode": conversion_mode,
+        "reward_weight": reward_weight,
+        "probability_cutoff": probability_cutoff,
+        "internal_top_k": internal_top_k,
+        "depth": depth,
+        "conversion_bonus": conversion_bonus,
+    }
+
+    info_cache[bitboard] = info
+    return info
+
+
+# ------------------------------------------------------------
+# Cached policy helpers
+# ------------------------------------------------------------
+
+def adaptive_depth_secm_v1_cached(bitboard, info_cache):
+    return board_info_secm_v1(bitboard, info_cache)["depth"]
+
+
+def probability_cutoff_secm_v1_cached(bitboard, info_cache):
+    return board_info_secm_v1(bitboard, info_cache)["probability_cutoff"]
+
+
+def internal_top_k_secm_v1_cached(bitboard, info_cache):
+    return board_info_secm_v1(bitboard, info_cache)["internal_top_k"]
+
+
+def reward_weight_secm_v1_cached(bitboard, info_cache):
+    return board_info_secm_v1(bitboard, info_cache)["reward_weight"]
+
+
+def move_bias_secm_v1_cached(bitboard, move, info_cache):
+    conversion_mode = board_info_secm_v1(bitboard, info_cache)["conversion_mode"]
+
+    if conversion_mode:
+        if move == "down":
+            return 1.5
+        if move == "right":
+            return 1.5
+        if move == "left":
+            return 0.0
+        return -1.0
+
+    if move == "down":
+        return 2.0
+    if move == "right":
+        return 2.0
+    if move == "left":
+        return 0.0
+    return -3.0
+
+
+def score_board_secm_v1_cached(bitboard, eval_cache, info_cache):
+    cached = eval_cache.get(bitboard)
+    if cached is not None:
+        return cached
+
+    info = board_info_secm_v1(bitboard, info_cache)
+    value = evaluate_board_fast(bitboard) + info["conversion_bonus"]
+    eval_cache[bitboard] = value
+    return value
+
+
+# ------------------------------------------------------------
+# Candidate generation without list sorting
+# ------------------------------------------------------------
+
+def _insert_candidate_desc_stable_secm_v1(c1, c2, c3, c4, cand):
+    score = cand[0]
+
+    if c1 is None or score > c1[0]:
+        return cand, c1, c2, c3
+    if c2 is None or score > c2[0]:
+        return c1, cand, c2, c3
+    if c3 is None or score > c3[0]:
+        return c1, c2, cand, c3
+    if c4 is None or score > c4[0]:
+        return c1, c2, c3, cand
+
+    return c1, c2, c3, c4
+
+
+def generate_candidates_secm_v1(bitboard, legal_moves, eval_cache, info_cache, top_k):
+    c1 = None
+    c2 = None
+    c3 = None
+    c4 = None
+
+    rw = reward_weight_secm_v1_cached(bitboard, info_cache)
+
+    for move in ("down", "right", "left", "up"):
+        if move not in legal_moves:
+            continue
+
+        next_bitboard, reward, changed = apply_move_bitboard(bitboard, move)
+        if not changed:
+            continue
+
+        quick_score = (
+            score_board_secm_v1_cached(next_bitboard, eval_cache, info_cache)
+            + rw * reward
+            + move_bias_secm_v1_cached(bitboard, move, info_cache)
+        )
+
+        cand = (quick_score, move, next_bitboard, reward)
+        c1, c2, c3, c4 = _insert_candidate_desc_stable_secm_v1(c1, c2, c3, c4, cand)
+
+    ordered = tuple(c for c in (c1, c2, c3, c4) if c is not None)
+    return ordered[:top_k]
+
+
+# ------------------------------------------------------------
+# Expectimax
+# ------------------------------------------------------------
+
+def player_value_secm_v1_exact_fast(bitboard, depth, cumulative_prob, tt_player, tt_chance, eval_cache, info_cache):
+    key = (int(bitboard), int(depth))
+    cached = tt_player.get(key)
+    if cached is not None:
+        return cached
+
+    legal_moves = get_legal_moves(bitboard)
+
+    if depth == 0 or not legal_moves:
+        value = score_board_secm_v1_cached(bitboard, eval_cache, info_cache)
+        tt_player[key] = value
+        return value
+
+    top_k = internal_top_k_secm_v1_cached(bitboard, info_cache)
+    candidates = generate_candidates_secm_v1(bitboard, legal_moves, eval_cache, info_cache, top_k)
+
+    best_value = float("-inf")
+    rw = reward_weight_secm_v1_cached(bitboard, info_cache)
+
+    for _, move, next_bitboard, reward in candidates:
+        value = (
+            rw * reward
+            + SECM_V1_AFTERSTATE_WEIGHT * score_board_secm_v1_cached(next_bitboard, eval_cache, info_cache)
+            + chance_value_secm_v1_exact_fast(
+                next_bitboard,
+                depth,
+                cumulative_prob,
+                tt_player,
+                tt_chance,
+                eval_cache,
+                info_cache,
+            )
+        )
+
+        if value > best_value:
+            best_value = value
+
+    if best_value == float("-inf"):
+        best_value = score_board_secm_v1_cached(bitboard, eval_cache, info_cache)
+
+    tt_player[key] = best_value
+    return best_value
+
+
+def chance_value_secm_v1_exact_fast(afterstate_bitboard, depth, cumulative_prob, tt_player, tt_chance, eval_cache, info_cache):
+    cutoff = probability_cutoff_secm_v1_cached(afterstate_bitboard, info_cache)
+
+    if depth <= 0 or cumulative_prob < cutoff:
+        return score_board_secm_v1_cached(afterstate_bitboard, eval_cache, info_cache)
+
+    conversion_mode = board_info_secm_v1(afterstate_bitboard, info_cache)["conversion_mode"]
+
+    if conversion_mode:
+        key = (int(afterstate_bitboard), int(depth), round(cumulative_prob, 6))
+    else:
+        key = (int(afterstate_bitboard), int(depth))
+
+    cached = tt_chance.get(key)
+    if cached is not None:
+        return cached
+
+    empties = board_info_secm_v1(afterstate_bitboard, info_cache)["empties"]
+
+    if empties == 0:
+        value = player_value_secm_v1_exact_fast(
+            afterstate_bitboard,
+            depth - 1,
+            cumulative_prob,
+            tt_player,
+            tt_chance,
+            eval_cache,
+            info_cache,
+        )
+        tt_chance[key] = value
+        return value
+
+    p2 = 0.9 / empties
+    p4 = 0.1 / empties
+    total = 0.0
+
+    for idx in range(16):
+        shift = 4 * idx
+        if ((afterstate_bitboard >> shift) & 0xF) != 0:
+            continue
+
+        spawned2 = afterstate_bitboard | (1 << shift)
+        prob2 = cumulative_prob * p2
+        if prob2 < cutoff:
+            total += p2 * score_board_secm_v1_cached(spawned2, eval_cache, info_cache)
+        else:
+            total += p2 * player_value_secm_v1_exact_fast(
+                spawned2,
+                depth - 1,
+                prob2,
+                tt_player,
+                tt_chance,
+                eval_cache,
+                info_cache,
+            )
+
+        spawned4 = afterstate_bitboard | (2 << shift)
+        prob4 = cumulative_prob * p4
+        if prob4 < cutoff:
+            total += p4 * score_board_secm_v1_cached(spawned4, eval_cache, info_cache)
+        else:
+            total += p4 * player_value_secm_v1_exact_fast(
+                spawned4,
+                depth - 1,
+                prob4,
+                tt_player,
+                tt_chance,
+                eval_cache,
+                info_cache,
+            )
+
+    tt_chance[key] = total
+    return total
+
+
+# ------------------------------------------------------------
+# Agent
+# ------------------------------------------------------------
+
+def conversion_aware_expectimax(bitboard, legal_moves, rng=None):
+    rng = rng or random
+
+    tt_player = {}
+    tt_chance = {}
+    eval_cache = {}
+    info_cache = {}
+
+    depth = adaptive_depth_secm_v1_cached(bitboard, info_cache)
+
+    candidates = generate_candidates_secm_v1(bitboard, legal_moves, eval_cache, info_cache, top_k=4)
+
+    best_value = float("-inf")
+    best_moves = []
+
+    rw = reward_weight_secm_v1_cached(bitboard, info_cache)
+
+    for _, move, next_bitboard, reward in candidates:
+        value = (
+            rw * reward
+            + SECM_V1_AFTERSTATE_WEIGHT * score_board_secm_v1_cached(next_bitboard, eval_cache, info_cache)
+            + chance_value_secm_v1_exact_fast(
+                next_bitboard,
+                depth,
+                1.0,
+                tt_player,
+                tt_chance,
+                eval_cache,
+                info_cache,
+            )
+        )
+
+        if value > best_value:
+            best_value = value
+            best_moves = [move]
+        elif value == best_value:
+            best_moves.append(move)
+
+    return rng.choice(best_moves) if best_moves else rng.choice(legal_moves)
