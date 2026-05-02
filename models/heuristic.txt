@@ -1,0 +1,104 @@
+# Heuristic Agent I
+# Historical notebook version: heuristic_agent_v3
+
+def monotonicity_score_heuristic_v1(bitboard):
+    """
+    Reward boards whose rows and columns are more monotonic.
+    """
+    board = bitboard_to_board(bitboard)
+    score = 0
+
+    for row in board:
+        for i in range(len(row) - 1):
+            if row[i] >= row[i + 1]:
+                score += 1
+
+    for col in zip(*board):
+        for i in range(len(col) - 1):
+            if col[i] >= col[i + 1]:
+                score += 1
+
+    return score
+
+
+def smoothness_score_heuristic_v1(bitboard):
+    """
+    Penalize large differences between neighboring tiles.
+    """
+    board = bitboard_to_board(bitboard)
+    score = 0
+
+    for r in range(4):
+        for c in range(3):
+            score -= abs(board[r][c] - board[r][c + 1])
+
+    for c in range(4):
+        for r in range(3):
+            score -= abs(board[r][c] - board[r + 1][c])
+
+    return score
+
+
+def heuristic_score_v1(bitboard):
+    """
+    Heuristic Agent I combining:
+    - empty cells
+    - max tile
+    - bottom-right corner preference
+    - monotonicity
+    - smoothness
+    """
+    empty_cells = 0
+    for idx in range(16):
+        if ((bitboard >> (4 * idx)) & 0xF) == 0:
+            empty_cells += 1
+
+    max_tile = get_max_tile(bitboard)
+    corner_tile = get_max_tile(bitboard) if ((bitboard >> (4 * 15)) & 0xF) == ((max(bitboard >> (4 * i) & 0xF for i in range(16))) if bitboard else 0) else None
+
+    board = bitboard_to_board(bitboard)
+    corner_bonus = 1 if board[3][3] == max_tile else 0
+
+    return (
+        50 * empty_cells
+        + 1.0 * max_tile
+        + 1000 * corner_bonus
+        + 20 * monotonicity_score_heuristic_v1(bitboard)
+        + 0.1 * smoothness_score_heuristic_v1(bitboard)
+    )
+
+
+def heuristic_agent_v1(bitboard, legal_moves, rng=None):
+    """
+    Choose the move whose resulting board has the best heuristic score.
+    """
+    rng = rng or random
+    best_moves = []
+    best_value = float("-inf")
+
+    for move in legal_moves:
+        next_bitboard, reward, changed = apply_move_bitboard(bitboard, move)
+        value = heuristic_score_v1(next_bitboard) + reward
+
+        if value > best_value:
+            best_value = value
+            best_moves = [move]
+        elif value == best_value:
+            best_moves.append(move)
+
+    return rng.choice(best_moves)
+
+
+HEURISTIC_AGENT_V1_NAME = "heuristic_agent_v1"
+HEURISTIC_AGENT_V1_GAMES = 100
+
+heuristic_agent_v1_artifact_100 = run_experiment(
+    name=HEURISTIC_AGENT_V1_NAME,
+    agent_fn=heuristic_agent_v1,
+    n_games=HEURISTIC_AGENT_V1_GAMES,
+    base_seed=BASE_SEED,
+    save_replays=True,
+    force=False,
+)
+
+heuristic_agent_v1_artifact_100["summary"]
