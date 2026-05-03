@@ -36,6 +36,7 @@ def build_input_artifact_index():
 
 build_input_artifact_index()
 
+
 # -------------------------------------------------------------------
 # Artifact path helpers
 # -------------------------------------------------------------------
@@ -212,34 +213,6 @@ def reached_at_least_df(artifact, thresholds=(128, 256, 512, 1024, 2048, 4096, 8
     return pd.DataFrame(rows)
 
 
-def _sorted_tile_counts(tile_counts):
-    return {int(k): tile_counts[k] for k in sorted(tile_counts)}
-
-
-def _summary_display_payload(summary):
-    return {
-        "games": int(summary["games"]),
-        "avg_score": round(float(summary["avg_score"]), 3),
-        "best_score": int(summary["best_score"]),
-        "avg_max_tile": round(float(summary["avg_max_tile"]), 3),
-        "best_max_tile": int(summary["best_max_tile"]),
-        "avg_move_count": round(float(summary["avg_move_count"]), 3),
-        "wins": int(summary["wins"]),
-        "tile_counts": _sorted_tile_counts(summary["tile_counts"]),
-    }
-
-
-def _summary_display_text(summary, target_games=None):
-    payload = _summary_display_payload(summary)
-
-    if target_games is None:
-        prefix = f"{payload['games']}-game summary:"
-    else:
-        prefix = f"{int(target_games)}-game summary (completed {payload['games']}/{int(target_games)}):"
-
-    return f"{prefix}\n{payload}"
-
-
 # -------------------------------------------------------------------
 # Board rendering helpers
 # -------------------------------------------------------------------
@@ -307,365 +280,6 @@ def render_board_html_from_bitboard(bitboard):
     """
 
 
-def render_monitor_slot_html(slot_idx, slot_state):
-    if slot_state is None:
-        return f"""
-        <div style="border:1px solid #ddd;border-radius:10px;padding:12px;">
-            <div style="font-weight:700;margin-bottom:8px;">CPU Slot {slot_idx + 1}</div>
-            <div style="color:#777;">Waiting...</div>
-        </div>
-        """
-
-    status = slot_state.get("status", "running")
-    game_index = slot_state.get("game_index", "?")
-    seed = slot_state.get("seed", "?")
-    step = slot_state.get("step", 0)
-    score = slot_state.get("score", 0)
-    max_tile = slot_state.get("max_tile", 0)
-    action = slot_state.get("action", None)
-    bitboard = slot_state["bitboard"]
-
-    board_html = render_board_html_from_bitboard(bitboard)
-
-    return f"""
-    <div style="border:1px solid #ddd;border-radius:10px;padding:12px;">
-        <div style="font-weight:700;margin-bottom:6px;">CPU Slot {slot_idx + 1}</div>
-        <div style="font-size:13px;line-height:1.5;margin-bottom:8px;">
-            <div><b>Status:</b> {status}</div>
-            <div><b>Game:</b> {game_index}</div>
-            <div><b>Seed:</b> {seed}</div>
-            <div><b>Step:</b> {step}</div>
-            <div><b>Score:</b> {score}</div>
-            <div><b>Max tile:</b> {max_tile}</div>
-            <div><b>Last action:</b> {action}</div>
-        </div>
-        {board_html}
-    </div>
-    """
-
-
-def render_finished_games_table_html(finished_games, finished_limit=12):
-    recent_finished = finished_games[-finished_limit:]
-
-    if not recent_finished:
-        return """
-        <div style="margin-top:14px;color:#777;font-family:Arial,sans-serif;">
-            No finished games yet.
-        </div>
-        """
-
-    rows_html = "".join(
-        f"""
-        <tr>
-            <td style="padding:6px 8px;border-bottom:1px solid #eee;">{g['finish_order']}</td>
-            <td style="padding:6px 8px;border-bottom:1px solid #eee;">{g['game_index']}</td>
-            <td style="padding:6px 8px;border-bottom:1px solid #eee;">{g['seed']}</td>
-            <td style="padding:6px 8px;border-bottom:1px solid #eee;">{g['final_score']}</td>
-            <td style="padding:6px 8px;border-bottom:1px solid #eee;">{g['max_tile']}</td>
-            <td style="padding:6px 8px;border-bottom:1px solid #eee;">{g['move_count']}</td>
-            <td style="padding:6px 8px;border-bottom:1px solid #eee;">{g['duration_sec']:.2f}s</td>
-            <td style="padding:6px 8px;border-bottom:1px solid #eee;">{g['won']}</td>
-        </tr>
-        """
-        for g in recent_finished
-    )
-
-    return f"""
-    <div style="margin-top:14px;">
-        <div style="font-size:15px;margin-bottom:8px;">
-            <b>Finished games</b> (latest {len(recent_finished)})
-        </div>
-        <div style="overflow-x:auto;">
-            <table style="border-collapse:collapse;font-family:Arial,sans-serif;font-size:13px;min-width:760px;">
-                <thead>
-                    <tr style="background:#f5f5f5;">
-                        <th style="padding:6px 8px;text-align:left;">Finish #</th>
-                        <th style="padding:6px 8px;text-align:left;">Game</th>
-                        <th style="padding:6px 8px;text-align:left;">Seed</th>
-                        <th style="padding:6px 8px;text-align:left;">Score</th>
-                        <th style="padding:6px 8px;text-align:left;">Max tile</th>
-                        <th style="padding:6px 8px;text-align:left;">Moves</th>
-                        <th style="padding:6px 8px;text-align:left;">Time</th>
-                        <th style="padding:6px 8px;text-align:left;">Won</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    {rows_html}
-                </tbody>
-            </table>
-        </div>
-    </div>
-    """
-
-
-def render_summary_text_html(finished_games, total_games):
-    if not finished_games:
-        text = f"{int(total_games)}-game summary (completed 0/{int(total_games)}):\nNo finished games yet."
-    else:
-        running_summary = summarize_games(finished_games)
-        text = _summary_display_text(running_summary, target_games=total_games)
-
-    return f"""
-    <div style="
-        margin-top:14px;
-        font-family:Consolas,Menlo,monospace;
-        font-size:13px;
-        white-space:pre-wrap;
-        border:1px solid #ddd;
-        border-radius:8px;
-        padding:12px;
-        background:#fafafa;
-    ">{text}</div>
-    """
-
-
-def render_live_monitor_html(
-    slot_states,
-    completed_games,
-    total_games,
-    avg_game_sec,
-    finished_games,
-    show_boards=True,
-    live_results_mode="none",
-    finished_limit=12,
-):
-    parts = []
-
-    if show_boards:
-        slots_html = "".join(
-            render_monitor_slot_html(i, slot_states[i])
-            for i in range(len(slot_states))
-        )
-
-        percent = 100.0 * completed_games / total_games if total_games else 0.0
-
-        parts.append(
-            f"""
-            <div style="font-size:15px;margin-bottom:10px;">
-                <b>Completed:</b> {completed_games}/{total_games}
-                &nbsp;|&nbsp;
-                <b>Percent:</b> {percent:.2f}%
-                &nbsp;|&nbsp;
-                <b>Avg completed game time:</b> {avg_game_sec:.2f}s
-            </div>
-            <div style="
-                display:grid;
-                grid-template-columns:repeat(2, minmax(320px, 1fr));
-                gap:12px;
-            ">
-                {slots_html}
-            </div>
-            """
-        )
-
-    if live_results_mode == "table_and_summary":
-        parts.append(render_summary_text_html(finished_games, total_games))
-        parts.append(render_finished_games_table_html(finished_games, finished_limit=finished_limit))
-    elif live_results_mode == "summary_only":
-        parts.append(render_summary_text_html(finished_games, total_games))
-
-    if not parts:
-        percent = 100.0 * completed_games / total_games if total_games else 0.0
-        parts.append(
-            f"""
-            <div style="font-size:15px;margin-bottom:10px;">
-                <b>Completed:</b> {completed_games}/{total_games}
-                &nbsp;|&nbsp;
-                <b>Percent:</b> {percent:.2f}%
-                &nbsp;|&nbsp;
-                <b>Avg completed game time:</b> {avg_game_sec:.2f}s
-            </div>
-            """
-        )
-
-    return f"""
-    <div style="margin-bottom:10px;font-family:Arial,sans-serif;">
-        {''.join(parts)}
-    </div>
-    """
-
-
-# -------------------------------------------------------------------
-# Plain live results output
-# -------------------------------------------------------------------
-
-def finished_games_df(finished_games, finished_limit=12):
-    recent_finished = finished_games[-finished_limit:]
-    if not recent_finished:
-        return pd.DataFrame(columns=[
-            "Finish #", "Game", "Seed", "Score", "Max tile", "Moves", "Time", "Won"
-        ])
-
-    return pd.DataFrame([
-        {
-            "Finish #": g["finish_order"],
-            "Game": g["game_index"],
-            "Seed": g["seed"],
-            "Score": g["final_score"],
-            "Max tile": g["max_tile"],
-            "Moves": g["move_count"],
-            "Time": f"{g['duration_sec']:.2f}s",
-            "Won": g["won"],
-        }
-        for g in recent_finished
-    ])
-
-
-def display_live_results_plain(finished_games, total_games, live_results_mode, finished_limit=12):
-    if live_results_mode == "none":
-        return
-
-    if not finished_games:
-        print(f"{int(total_games)}-game summary (completed 0/{int(total_games)}):")
-        print("No finished games yet.")
-        return
-
-    running_summary = summarize_games(finished_games)
-    print(_summary_display_text(running_summary, target_games=total_games))
-
-    if live_results_mode == "table_and_summary":
-        df = finished_games_df(finished_games, finished_limit=finished_limit)
-        print(f"\nFinished games (latest {len(df)}):")
-        display(df)
-
-
-# -------------------------------------------------------------------
-# Live monitor
-# -------------------------------------------------------------------
-
-class LiveGameMonitor:
-    """
-    Shows:
-    - optional 4 stable CPU slots
-    - optional live finished-game results
-
-    show_boards controls CPU board display.
-    live_results_mode controls results display independently:
-    - "none"
-    - "table_and_summary"
-    - "summary_only"
-    """
-
-    def __init__(
-        self,
-        event_queue=None,
-        n_slots=4,
-        refresh_seconds=DEFAULT_MONITOR_REFRESH_SECONDS,
-        show_boards=True,
-        live_results_mode="none",
-        finished_limit=12,
-    ):
-        self.event_queue = event_queue
-        self.n_slots = n_slots
-        self.refresh_seconds = refresh_seconds
-        self.show_boards = show_boards
-        self.live_results_mode = live_results_mode
-        self.finished_limit = finished_limit
-
-        self.output = widgets.Output()
-        self.slot_states = [None] * n_slots
-        self.pid_to_slot = {}
-
-        self.completed_games = 0
-        self.total_games = 0
-        self.avg_game_sec = 0.0
-        self.finished_games = []
-
-        self._stop_event = threading.Event()
-        self._thread = None
-        self._last_render_time = 0.0
-
-    def start(self, total_games):
-        self.total_games = total_games
-        display(self.output)
-        self._render(force=True)
-
-        if self.show_boards and self.event_queue is not None:
-            self._thread = threading.Thread(target=self._run, daemon=True)
-            self._thread.start()
-
-    def stop(self):
-        self._stop_event.set()
-        if self._thread is not None:
-            self._thread.join(timeout=1.0)
-        self._render(force=True)
-
-    def update_progress(self, completed_games, avg_game_sec):
-        self.completed_games = completed_games
-        self.avg_game_sec = avg_game_sec
-
-    def add_finished_game(self, result):
-        self.finished_games.append({
-            "finish_order": len(self.finished_games) + 1,
-            "game_index": result["game_index"],
-            "seed": result["seed"],
-            "final_score": result["final_score"],
-            "max_tile": result["max_tile"],
-            "move_count": result["move_count"],
-            "duration_sec": result["duration_sec"],
-            "won": result["won"],
-        })
-
-    def _assign_slot(self, pid):
-        if pid in self.pid_to_slot:
-            return self.pid_to_slot[pid]
-
-        used = set(self.pid_to_slot.values())
-        for slot in range(self.n_slots):
-            if slot not in used:
-                self.pid_to_slot[pid] = slot
-                return slot
-
-        slot = len(self.pid_to_slot) % self.n_slots
-        self.pid_to_slot[pid] = slot
-        return slot
-
-    def _handle_event(self, event):
-        pid = event["pid"]
-        slot = self._assign_slot(pid)
-        self.slot_states[slot] = event
-
-    def _render(self, force=False):
-        now = time.time()
-        if not force and (now - self._last_render_time) < self.refresh_seconds:
-            return
-
-        with self.output:
-            clear_output(wait=True)
-
-            if self.show_boards:
-                html = render_live_monitor_html(
-                    self.slot_states,
-                    self.completed_games,
-                    self.total_games,
-                    self.avg_game_sec,
-                    self.finished_games,
-                    show_boards=self.show_boards,
-                    live_results_mode=self.live_results_mode,
-                    finished_limit=self.finished_limit,
-                )
-                display(HTML(html))
-            else:
-                display_live_results_plain(
-                    finished_games=self.finished_games,
-                    total_games=self.total_games,
-                    live_results_mode=self.live_results_mode,
-                    finished_limit=self.finished_limit,
-                )
-
-        self._last_render_time = now
-
-    def _run(self):
-        while not self._stop_event.is_set():
-            try:
-                event = self.event_queue.get(timeout=0.1)
-                self._handle_event(event)
-                self._render(force=False)
-            except queue.Empty:
-                self._render(force=False)
-                continue
-
-
 # -------------------------------------------------------------------
 # Game worker
 # -------------------------------------------------------------------
@@ -675,23 +289,16 @@ def play_one_game_bitboard(
     seed=None,
     game_index=None,
     max_steps=MAX_STEPS,
-    snapshot_every_steps=DEFAULT_SNAPSHOT_EVERY_STEPS,
-    monitor_queue=None,
     collect_frames=False,
 ):
     """
     Play one full game using a bitboard-based agent.
     The agent must have signature: agent_fn(bitboard, legal_moves, rng)
-
-    This version avoids:
-    - board conversion on every step
-    - legal-move recompute inside env info
     """
     rng = random.Random(seed)
     env = Game2048Env(rng=rng)
 
-    # Keep this reset to preserve the old seed-to-game mapping used by your current notebook.
-    # If you do not care about exact continuity with past runs, removing this line is slightly faster.
+    # Keep this reset to preserve the old seed-to-game mapping used by your notebook.
     env.reset()
 
     max_tile_fn = globals().get("get_max_tile_fast", get_max_tile)
@@ -708,19 +315,6 @@ def play_one_game_bitboard(
             "max_tile": max_tile_fn(env.board),
             "bitboard": env.board,
         }]
-
-    if monitor_queue is not None:
-        monitor_queue.put({
-            "pid": os.getpid(),
-            "status": "running",
-            "game_index": game_index,
-            "seed": seed,
-            "step": 0,
-            "score": env.get_score(),
-            "max_tile": max_tile_fn(env.board),
-            "action": None,
-            "bitboard": env.board,
-        })
 
     while not env.done and env.get_move_count() < max_steps:
         bitboard = env.board
@@ -744,24 +338,6 @@ def play_one_game_bitboard(
                 "bitboard": env.board,
             })
 
-        if (
-            monitor_queue is not None
-            and snapshot_every_steps is not None
-            and snapshot_every_steps > 0
-            and info["move_count"] % snapshot_every_steps == 0
-        ):
-            monitor_queue.put({
-                "pid": os.getpid(),
-                "status": "running",
-                "game_index": game_index,
-                "seed": seed,
-                "step": info["move_count"],
-                "score": info["score"],
-                "max_tile": info["max_tile"],
-                "action": action,
-                "bitboard": env.board,
-            })
-
     duration_sec = time.perf_counter() - start_time
 
     result = {
@@ -777,19 +353,6 @@ def play_one_game_bitboard(
     if collect_frames:
         result["frames"] = frames
 
-    if monitor_queue is not None:
-        monitor_queue.put({
-            "pid": os.getpid(),
-            "status": "done",
-            "game_index": game_index,
-            "seed": seed,
-            "step": env.get_move_count(),
-            "score": env.get_score(),
-            "max_tile": max_tile_fn(env.board),
-            "action": frames[-1]["action"] if collect_frames and frames else None,
-            "bitboard": env.board,
-        })
-
     return result
 
 
@@ -803,10 +366,6 @@ def run_experiment(
     n_games=100,
     base_seed=BASE_SEED,
     max_steps=MAX_STEPS,
-    snapshot_every_steps=DEFAULT_SNAPSHOT_EVERY_STEPS,
-    show_live=False,
-    live_results_mode="none",   # "none", "table_and_summary", "summary_only"
-    finished_limit=12,
     save_replays=False,
     force=False,
 ):
@@ -820,9 +379,6 @@ def run_experiment(
 
     Saves replays.json.gz only if save_replays=True.
     """
-    if live_results_mode not in {"none", "table_and_summary", "summary_only"}:
-        raise ValueError("live_results_mode must be one of: 'none', 'table_and_summary', 'summary_only'.")
-
     cache_key = artifact_cache_key(name, n_games, base_seed, max_steps)
     paths = artifact_rel_paths(name, n_games, base_seed, max_steps)
 
@@ -863,27 +419,6 @@ def run_experiment(
 
     seeds = [base_seed + i for i in range(n_games)]
 
-    monitor_queue = None
-    monitor = None
-    manager = None
-
-    should_show_any_live_output = show_live or (live_results_mode != "none")
-
-    if should_show_any_live_output:
-        if show_live:
-            manager = Manager()
-            monitor_queue = manager.Queue()
-
-        monitor = LiveGameMonitor(
-            event_queue=monitor_queue,
-            n_slots=N_JOBS,
-            refresh_seconds=DEFAULT_MONITOR_REFRESH_SECONDS,
-            show_boards=show_live,
-            live_results_mode=live_results_mode,
-            finished_limit=finished_limit,
-        )
-        monitor.start(total_games=n_games)
-
     results = []
     total_time = 0.0
     completed_games = 0
@@ -894,37 +429,25 @@ def run_experiment(
         return_as="generator_unordered",
     )
 
-    try:
-        with tqdm(total=n_games, desc=f"Evaluating {name}") as pbar:
-            for result in parallel(
-                delayed(play_one_game_bitboard)(
-                    agent_fn=agent_fn,
-                    seed=seed,
-                    game_index=i + 1,
-                    max_steps=max_steps,
-                    snapshot_every_steps=snapshot_every_steps,
-                    monitor_queue=monitor_queue,
-                    collect_frames=save_replays,
-                )
-                for i, seed in enumerate(seeds)
-            ):
-                results.append(result)
+    with tqdm(total=n_games, desc=f"Evaluating {name}") as pbar:
+        for result in parallel(
+            delayed(play_one_game_bitboard)(
+                agent_fn=agent_fn,
+                seed=seed,
+                game_index=i + 1,
+                max_steps=max_steps,
+                collect_frames=save_replays,
+            )
+            for i, seed in enumerate(seeds)
+        ):
+            results.append(result)
 
-                completed_games += 1
-                total_time += result["duration_sec"]
-                avg_game_sec = total_time / completed_games
+            completed_games += 1
+            total_time += result["duration_sec"]
+            avg_game_sec = total_time / completed_games
 
-                pbar.update(1)
-                pbar.set_postfix(avg_game_s=f"{avg_game_sec:.2f}")
-
-                if monitor is not None:
-                    monitor.update_progress(completed_games, avg_game_sec)
-                    monitor.add_finished_game(result)
-                    monitor._render(force=True)
-
-    finally:
-        if monitor is not None:
-            monitor.stop()
+            pbar.update(1)
+            pbar.set_postfix(avg_game_s=f"{avg_game_sec:.2f}")
 
     results.sort(key=lambda x: x["game_index"])
 
@@ -1245,8 +768,6 @@ def rebuild_replay(
         seed=selected["seed"],
         game_index=selected["game_index"],
         max_steps=max_steps,
-        snapshot_every_steps=None,
-        monitor_queue=None,
         collect_frames=True,
     )
 
@@ -1282,6 +803,7 @@ def rebuild_replay(
         return replay
 
     return None
+
 
 def compare_models_simple(comparison_specs, max_steps=MAX_STEPS):
     """
