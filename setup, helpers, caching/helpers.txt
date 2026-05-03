@@ -1,7 +1,6 @@
 # Notebook helpers
 # - artifact loading/saving
 # - experiment running / caching
-# - live monitor
 # - replay rebuilding / replay viewer
 # - CSV table saving for per-game results
 
@@ -10,6 +9,7 @@
 # -------------------------------------------------------------------
 
 INPUT_ARTIFACT_INDEX = {}
+
 
 def build_input_artifact_index():
     """
@@ -146,6 +146,7 @@ def _normalize_loaded_summary(summary):
         summary["tile_counts"] = {int(k): v for k, v in summary["tile_counts"].items()}
     return summary
 
+
 # -------------------------------------------------------------------
 # Summary helpers
 # -------------------------------------------------------------------
@@ -237,6 +238,7 @@ def _summary_display_text(summary, target_games=None):
         prefix = f"{int(target_games)}-game summary (completed {payload['games']}/{int(target_games)}):"
 
     return f"{prefix}\n{payload}"
+
 
 # -------------------------------------------------------------------
 # Board rendering helpers
@@ -482,6 +484,7 @@ def render_live_monitor_html(
     </div>
     """
 
+
 # -------------------------------------------------------------------
 # Plain live results output
 # -------------------------------------------------------------------
@@ -524,6 +527,7 @@ def display_live_results_plain(finished_games, total_games, live_results_mode, f
         df = finished_games_df(finished_games, finished_limit=finished_limit)
         print(f"\nFinished games (latest {len(df)}):")
         display(df)
+
 
 # -------------------------------------------------------------------
 # Live monitor
@@ -661,6 +665,7 @@ class LiveGameMonitor:
                 self._render(force=False)
                 continue
 
+
 # -------------------------------------------------------------------
 # Game worker
 # -------------------------------------------------------------------
@@ -689,6 +694,8 @@ def play_one_game_bitboard(
     # If you do not care about exact continuity with past runs, removing this line is slightly faster.
     env.reset()
 
+    max_tile_fn = globals().get("get_max_tile_fast", get_max_tile)
+
     start_time = time.perf_counter()
 
     frames = None
@@ -698,7 +705,7 @@ def play_one_game_bitboard(
             "action": None,
             "reward": 0,
             "score": env.get_score(),
-            "max_tile": get_max_tile_fast(env.board),
+            "max_tile": max_tile_fn(env.board),
             "bitboard": env.board,
         }]
 
@@ -710,7 +717,7 @@ def play_one_game_bitboard(
             "seed": seed,
             "step": 0,
             "score": env.get_score(),
-            "max_tile": get_max_tile_fast(env.board),
+            "max_tile": max_tile_fn(env.board),
             "action": None,
             "bitboard": env.board,
         })
@@ -761,7 +768,7 @@ def play_one_game_bitboard(
         "game_index": game_index,
         "seed": seed,
         "final_score": env.get_score(),
-        "max_tile": get_max_tile_fast(env.board),
+        "max_tile": max_tile_fn(env.board),
         "move_count": env.get_move_count(),
         "won": env.won,
         "duration_sec": duration_sec,
@@ -778,13 +785,12 @@ def play_one_game_bitboard(
             "seed": seed,
             "step": env.get_move_count(),
             "score": env.get_score(),
-            "max_tile": get_max_tile_fast(env.board),
+            "max_tile": max_tile_fn(env.board),
             "action": frames[-1]["action"] if collect_frames and frames else None,
             "bitboard": env.board,
         })
 
     return result
-
 
 
 # -------------------------------------------------------------------
@@ -798,7 +804,7 @@ def run_experiment(
     base_seed=BASE_SEED,
     max_steps=MAX_STEPS,
     snapshot_every_steps=DEFAULT_SNAPSHOT_EVERY_STEPS,
-    show_live=True,
+    show_live=False,
     live_results_mode="none",   # "none", "table_and_summary", "summary_only"
     finished_limit=12,
     save_replays=False,
@@ -991,6 +997,7 @@ def load_experiment(
     EXPERIMENT_MEMORY_CACHE[cache_key] = artifact
     return artifact
 
+
 # -------------------------------------------------------------------
 # Replay selection helpers
 # -------------------------------------------------------------------
@@ -1052,6 +1059,7 @@ def replay_candidates_df(replays, target_tile=None, mode="best"):
         })
 
     return pd.DataFrame(rows)
+
 
 # -------------------------------------------------------------------
 # Replay viewer
@@ -1275,53 +1283,35 @@ def rebuild_replay(
 
     return None
 
-
-# Hot-path internal helpers
-# Keep public helpers unchanged; these are for fast runtime paths only.
-
-def get_max_tile_fast(bitboard: BitBoard) -> int:
-    max_exp = 0
-    for idx in range(16):
-        exp = (bitboard >> (4 * idx)) & 0xF
-        if exp > max_exp:
-            max_exp = exp
-    return 0 if max_exp == 0 else (1 << max_exp)
-
-
-def spawn_random_tile_bitboard_fast(bitboard: BitBoard, rng: Optional[random.Random] = None) -> BitBoard:
+def compare_models_simple(comparison_specs, max_steps=MAX_STEPS):
     """
-    Same logic as spawn_random_tile_bitboard, but:
-    - no repeated validation
-    - no empty-position list allocation
+    comparison_specs: list of (name, n_games)
+    Example:
+        [("random", 100), ("greedy", 100)]
     """
-    rng = rng or random
+    rows = []
 
-    empty_count = 0
-    for idx in range(16):
-        if ((bitboard >> (4 * idx)) & 0xF) == 0:
-            empty_count += 1
+    for name, n_games in comparison_specs:
+        artifact = load_experiment(
+            name=name,
+            n_games=n_games,
+            base_seed=BASE_SEED,
+            max_steps=max_steps,
+            load_replays=False,
+        )
 
-    if empty_count == 0:
-        return bitboard
+        s = artifact["summary"]
 
-    target_empty = rng.randrange(empty_count)
+        rows.append({
+            "agent": f"{name}_{n_games}",
+            "best_score": s["best_score"],
+            "avg_score": round(s["avg_score"], 2),
+            "best_max_tile": s["best_max_tile"],
+            "avg_max_tile": round(s["avg_max_tile"], 2),
+            "avg_move_count": round(s["avg_move_count"], 2),
+            "wins": s["wins"],
+        })
 
-    chosen_idx = -1
-    for idx in range(16):
-        if ((bitboard >> (4 * idx)) & 0xF) == 0:
-            if target_empty == 0:
-                chosen_idx = idx
-                break
-            target_empty -= 1
-
-    exp = 1 if rng.random() < TWO_PROBABILITY else 2
-    shift = 4 * chosen_idx
-    return (bitboard & ~(0xF << shift)) | (exp << shift)
-
-
-def create_initial_bitboard_fast(rng: Optional[random.Random] = None) -> BitBoard:
-    rng = rng or random
-    bitboard = 0
-    bitboard = spawn_random_tile_bitboard_fast(bitboard, rng)
-    bitboard = spawn_random_tile_bitboard_fast(bitboard, rng)
-    return bitboard
+    comparison_df = pd.DataFrame(rows)
+    display(comparison_df)
+    return comparison_df
