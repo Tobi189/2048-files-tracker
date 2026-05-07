@@ -1,8 +1,13 @@
 # Notebook helpers
 # - artifact loading/saving
 # - experiment running / caching
-# - replay rebuilding / replay viewer
+# - replay rebuilding / browser-based replay viewer
 # - CSV table saving for per-game results
+# - comparison tables
+
+import uuid
+from IPython.display import HTML, display
+
 
 # -------------------------------------------------------------------
 # Artifact indexing
@@ -19,7 +24,11 @@ def build_input_artifact_index():
     global INPUT_ARTIFACT_INDEX
     INPUT_ARTIFACT_INDEX = {}
 
-    for dirname, _, filenames in os.walk("/kaggle/input"):
+    input_root = "/kaggle/input"
+    if not os.path.exists(input_root):
+        return
+
+    for dirname, _, filenames in os.walk(input_root):
         marker = f"/{ARTIFACT_ROOT_NAME}/"
         if marker not in dirname:
             continue
@@ -109,9 +118,9 @@ def load_json(rel_path, compress=False):
     if compress:
         with gzip.open(path, "rt", encoding="utf-8") as f:
             return json.load(f)
-    else:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
 
 
 def save_games_table_csv(games_data, name, n_games, base_seed, max_steps):
@@ -149,7 +158,7 @@ def _normalize_loaded_summary(summary):
 
 
 # -------------------------------------------------------------------
-# Summary helpers
+# Summary / evaluation helpers
 # -------------------------------------------------------------------
 
 def summarize_games(games):
@@ -214,7 +223,7 @@ def reached_at_least_df(artifact, thresholds=(128, 256, 512, 1024, 2048, 4096, 8
 
 
 # -------------------------------------------------------------------
-# Board rendering helpers
+# Board rendering
 # -------------------------------------------------------------------
 
 tile_colors = {
@@ -238,32 +247,36 @@ tile_colors = {
 
 
 def render_board_html_from_bitboard(bitboard):
-    board = bitboard_to_board(int(bitboard))
+    """
+    Static board renderer used by the manual game widget.
+    """
     cells = []
 
-    for row in board:
-        for value in row:
-            color = tile_colors.get(value, "#111111")
-            text_color = "#776e65" if value <= 4 else "white"
-            text = "" if value == 0 else str(value)
+    for idx in range(16):
+        exp = (int(bitboard) >> (4 * idx)) & 0xF
+        value = 0 if exp == 0 else (1 << exp)
 
-            cells.append(
-                f"""
-                <div style="
-                    width:68px;
-                    height:68px;
-                    border-radius:6px;
-                    background:{color};
-                    color:{text_color};
-                    display:flex;
-                    align-items:center;
-                    justify-content:center;
-                    font-weight:700;
-                    font-size:20px;
-                    font-family:Arial,sans-serif;
-                ">{text}</div>
-                """
-            )
+        color = tile_colors.get(value, "#111111")
+        text_color = "#776e65" if value <= 4 else "white"
+        text = "" if value == 0 else str(value)
+
+        cells.append(
+            f"""
+            <div style="
+                width:68px;
+                height:68px;
+                border-radius:6px;
+                background:{color};
+                color:{text_color};
+                display:flex;
+                align-items:center;
+                justify-content:center;
+                font-weight:700;
+                font-size:20px;
+                font-family:Arial,sans-serif;
+            ">{text}</div>
+            """
+        )
 
     return f"""
     <div style="
@@ -298,11 +311,10 @@ def play_one_game_bitboard(
     rng = random.Random(seed)
     env = Game2048Env(rng=rng)
 
-    # Keep this reset to preserve the old seed-to-game mapping used by your notebook.
+    # Preserves the seed-to-game mapping used in the current notebook.
     env.reset()
 
     max_tile_fn = globals().get("get_max_tile_fast", get_max_tile)
-
     start_time = time.perf_counter()
 
     frames = None
@@ -313,11 +325,11 @@ def play_one_game_bitboard(
             "reward": 0,
             "score": env.get_score(),
             "max_tile": max_tile_fn(env.board),
-            "bitboard": env.board,
+            "bitboard": int(env.board),
         }]
 
     while not env.done and env.get_move_count() < max_steps:
-        bitboard = env.board
+        bitboard = int(env.board)
         legal_moves = env.get_legal_moves()
 
         action = agent_fn(bitboard, legal_moves, rng)
@@ -335,7 +347,7 @@ def play_one_game_bitboard(
                 "reward": reward,
                 "score": info["score"],
                 "max_tile": info["max_tile"],
-                "bitboard": env.board,
+                "bitboard": int(env.board),
             })
 
     duration_sec = time.perf_counter() - start_time
@@ -522,27 +534,64 @@ def load_experiment(
 
 
 # -------------------------------------------------------------------
-# Replay selection helpers
+# Replay selection / rebuilding
 # -------------------------------------------------------------------
 
-def select_replay_record(replays, target_tile=None, mode="best", rank=1):
-    if not replays:
+REPLAY_MEMORY_CACHE = {}
+
+
+def replay_candidates_df(games_data, target_tile=None, mode="best"):
+    """
+    Show candidate games for replay selection.
+    """
+    if not games_data:
+        return pd.DataFrame()
+
+    if target_tile is None:
+        target_tile = max(g["max_tile"] for g in games_data)
+
+    candidates = [g for g in games_data if g["max_tile"] == target_tile]
+    reverse = mode == "best"
+
+    candidates = sorted(
+        candidates,
+        key=lambda g: (g["final_score"], g["move_count"], g["seed"]),
+        reverse=reverse,
+    )
+
+    return pd.DataFrame([
+        {
+            "rank": i,
+            "game_index": g["game_index"],
+            "seed": g["seed"],
+            "final_score": g["final_score"],
+            "max_tile": g["max_tile"],
+            "move_count": g["move_count"],
+            "duration_sec": g["duration_sec"],
+            "won": g["won"],
+        }
+        for i, g in enumerate(candidates, start=1)
+    ])
+
+
+def _select_game_summary(games_data, target_tile=None, mode="best", rank=1):
+    if not games_data:
         return None
 
     if target_tile is None:
-        target_tile = max(r["max_tile"] for r in replays)
+        target_tile = max(g["max_tile"] for g in games_data)
 
-    candidates = [r for r in replays if r["max_tile"] == target_tile]
+    candidates = [g for g in games_data if g["max_tile"] == target_tile]
     if not candidates:
         return None
 
     if mode not in {"best", "worst"}:
         raise ValueError("mode must be 'best' or 'worst'.")
 
-    reverse = (mode == "best")
+    reverse = mode == "best"
     candidates = sorted(
         candidates,
-        key=lambda r: (r["final_score"], r["move_count"], r["seed"]),
+        key=lambda g: (g["final_score"], g["move_count"], g["seed"]),
         reverse=reverse,
     )
 
@@ -552,107 +601,41 @@ def select_replay_record(replays, target_tile=None, mode="best", rank=1):
     return candidates[rank - 1]
 
 
-def replay_candidates_df(replays, target_tile=None, mode="best"):
-    if not replays:
-        return pd.DataFrame()
+def _save_replay_to_artifacts(replay, name, n_games, base_seed, max_steps):
+    paths = artifact_rel_paths(name, n_games, base_seed, max_steps)
 
-    if target_tile is None:
-        target_tile = max(r["max_tile"] for r in replays)
+    existing = []
+    if artifact_read_path(paths["replays"]) is not None:
+        existing = load_json(paths["replays"], compress=True)
 
-    candidates = [r for r in replays if r["max_tile"] == target_tile]
-    reverse = (mode == "best")
+    existing = [r for r in existing if r["seed"] != replay["seed"]]
+    existing.append(replay)
+    existing.sort(key=lambda r: r["game_index"])
 
-    candidates = sorted(
-        candidates,
-        key=lambda r: (r["final_score"], r["move_count"], r["seed"]),
-        reverse=reverse,
-    )
+    save_json(existing, paths["replays"], compress=True)
 
-    rows = []
-    for i, r in enumerate(candidates, start=1):
-        rows.append({
-            "rank": i,
-            "game_index": r["game_index"],
-            "seed": r["seed"],
-            "final_score": r["final_score"],
-            "max_tile": r["max_tile"],
-            "move_count": r["move_count"],
-            "duration_sec": r["duration_sec"],
-            "won": r["won"],
-        })
-
-    return pd.DataFrame(rows)
+    cache_key = artifact_cache_key(name, n_games, base_seed, max_steps)
+    if cache_key in EXPERIMENT_MEMORY_CACHE:
+        EXPERIMENT_MEMORY_CACHE[cache_key]["replays"] = existing
 
 
-# -------------------------------------------------------------------
-# Replay viewer
-# -------------------------------------------------------------------
-
-def show_replay_buttons(replay):
-    frames = replay["frames"]
-    current_idx = 0
-
-    header = widgets.HTML()
-    board_widget = widgets.HTML()
-
-    def clamp_index(idx):
-        return max(0, min(len(frames) - 1, idx))
-
-    def render_frame(idx):
-        nonlocal current_idx
-        current_idx = clamp_index(idx)
-
-        frame = frames[current_idx]
-        board_html = render_board_html_from_bitboard(frame["bitboard"])
-
-        header.value = (
-            f"<b>Seed:</b> {replay['seed']} | "
-            f"<b>Frame:</b> {current_idx + 1}/{len(frames)} | "
-            f"<b>Step:</b> {frame['step']} | "
-            f"<b>Action:</b> {frame['action']} | "
-            f"<b>Reward:</b> {frame['reward']} | "
-            f"<b>Score:</b> {frame['score']} | "
-            f"<b>Max tile:</b> {frame['max_tile']}"
-        )
-
-        board_widget.value = board_html
-
-    def make_button(text, delta):
-        button = widgets.Button(description=text)
-        button.on_click(lambda _: render_frame(current_idx + delta))
-        return button
-
-    btn_first = widgets.Button(description="First")
-    btn_last = widgets.Button(description="Last")
-    btn_m100 = make_button("-100", -100)
-    btn_m10 = make_button("-10", -10)
-    btn_prev = make_button("Prev", -1)
-    btn_next = make_button("Next", 1)
-    btn_p10 = make_button("+10", 10)
-    btn_p100 = make_button("+100", 100)
-
-    btn_first.on_click(lambda _: render_frame(0))
-    btn_last.on_click(lambda _: render_frame(len(frames) - 1))
-
-    controls = widgets.HBox([btn_first, btn_m100, btn_m10, btn_prev, btn_next, btn_p10, btn_p100, btn_last])
-
-    display(header)
-    display(controls)
-    display(board_widget)
-
-    render_frame(0)
-
-
-def show_saved_replay(
+def get_cached_replay(
     name,
+    agent_fn=None,
     n_games=100,
     base_seed=BASE_SEED,
     max_steps=MAX_STEPS,
     target_tile=None,
     mode="best",
     rank=1,
+    save_replay=True,
+    force_rebuild=False,
     show_table=False,
 ):
+    """
+    Load a replay from memory/artifacts if available.
+    If frames are missing, rebuild only the selected game's seed once.
+    """
     artifact = load_experiment(
         name=name,
         n_games=n_games,
@@ -661,38 +644,61 @@ def show_saved_replay(
         load_replays=True,
     )
 
-    if "replays" not in artifact:
-        print("No saved replays found for this experiment. Re-run it with save_replays=True.")
-        return None
-
-    replays = artifact["replays"]
+    games_data = artifact["games_data"]
 
     if show_table:
-        display(replay_candidates_df(replays, target_tile=target_tile, mode=mode))
+        display(replay_candidates_df(games_data, target_tile=target_tile, mode=mode))
 
-    replay = select_replay_record(
-        replays=replays,
+    selected = _select_game_summary(
+        games_data=games_data,
         target_tile=target_tile,
         mode=mode,
         rank=rank,
     )
 
-    if replay is None:
-        print("No matching replay found.")
+    if selected is None:
+        print("No matching game found.")
         return None
 
-    print({
-        "selected_game_index": replay["game_index"],
-        "selected_seed": replay["seed"],
-        "selected_score": replay["final_score"],
-        "selected_max_tile": replay["max_tile"],
-        "selected_move_count": replay["move_count"],
-        "selected_duration_sec": replay["duration_sec"],
-        "mode": mode,
-        "rank": rank,
-    })
+    replay_key = (
+        normalize_experiment_name(name),
+        int(n_games),
+        int(base_seed),
+        int(max_steps),
+        int(selected["seed"]),
+    )
 
-    show_replay_buttons(replay)
+    if not force_rebuild and replay_key in REPLAY_MEMORY_CACHE:
+        print(f"[MEMORY] replay loaded for seed {selected['seed']}")
+        return REPLAY_MEMORY_CACHE[replay_key]
+
+    for replay in artifact.get("replays", []):
+        if replay.get("seed") == selected["seed"] and "frames" in replay:
+            REPLAY_MEMORY_CACHE[replay_key] = replay
+            print(f"[LOAD] replay loaded from saved artifacts for seed {selected['seed']}")
+            return replay
+
+    if agent_fn is None:
+        raise ValueError(
+            "Replay frames were not saved for this game. "
+            "Pass agent_fn so the selected replay can be rebuilt."
+        )
+
+    print(f"[REBUILD] rebuilding one replay for seed {selected['seed']}")
+
+    replay = play_one_game_bitboard(
+        agent_fn=agent_fn,
+        seed=selected["seed"],
+        game_index=selected["game_index"],
+        max_steps=max_steps,
+        collect_frames=True,
+    )
+
+    REPLAY_MEMORY_CACHE[replay_key] = replay
+
+    if save_replay:
+        _save_replay_to_artifacts(replay, name, n_games, base_seed, max_steps)
+
     return replay
 
 
@@ -710,94 +716,25 @@ def rebuild_replay(
     return_replay=False,
 ):
     """
-    Rebuild one replay from a saved summary-only experiment.
+    Rebuild and display one selected replay.
+    Kept for compatibility with earlier notebook cells.
     """
-    artifact = load_experiment(
+    replay = get_cached_replay(
         name=name,
+        agent_fn=agent_fn,
         n_games=n_games,
         base_seed=base_seed,
         max_steps=max_steps,
-        load_replays=False,
+        target_tile=target_tile,
+        mode=mode,
+        rank=rank,
+        save_replay=save_replay,
+        force_rebuild=True,
+        show_table=show_table,
     )
 
-    games_data = artifact["games_data"]
-    if not games_data:
-        print("No saved games_data found.")
-        return None
-
-    if target_tile is None:
-        target_tile = max(g["max_tile"] for g in games_data)
-
-    candidates = [g for g in games_data if g["max_tile"] == target_tile]
-    if not candidates:
-        print(f"No games found with max_tile == {target_tile}.")
-        return None
-
-    if mode not in {"best", "worst"}:
-        raise ValueError("mode must be 'best' or 'worst'.")
-
-    reverse = (mode == "best")
-    candidates = sorted(
-        candidates,
-        key=lambda g: (g["final_score"], g["move_count"], g["seed"]),
-        reverse=reverse,
-    )
-
-    if rank < 1 or rank > len(candidates):
-        raise ValueError(f"rank must be between 1 and {len(candidates)}.")
-
-    if show_table:
-        display(pd.DataFrame([
-            {
-                "rank": i + 1,
-                "game_index": g["game_index"],
-                "seed": g["seed"],
-                "final_score": g["final_score"],
-                "max_tile": g["max_tile"],
-                "move_count": g["move_count"],
-                "duration_sec": g["duration_sec"],
-                "won": g["won"],
-            }
-            for i, g in enumerate(candidates)
-        ]))
-
-    selected = candidates[rank - 1]
-
-    replay = play_one_game_bitboard(
-        agent_fn=agent_fn,
-        seed=selected["seed"],
-        game_index=selected["game_index"],
-        max_steps=max_steps,
-        collect_frames=True,
-    )
-
-    if save_replay:
-        paths = artifact_rel_paths(name, n_games, base_seed, max_steps)
-        existing = None
-
-        if artifact_read_path(paths["replays"]) is not None:
-            existing = load_json(paths["replays"], compress=True)
-
-        if existing is None:
-            existing = []
-
-        existing = [r for r in existing if r["seed"] != replay["seed"]]
-        existing.append(replay)
-        existing.sort(key=lambda x: x["game_index"])
-
-        save_json(existing, paths["replays"], compress=True)
-
-    print({
-        "selected_game_index": selected["game_index"],
-        "selected_seed": selected["seed"],
-        "selected_score": selected["final_score"],
-        "selected_max_tile": selected["max_tile"],
-        "selected_move_count": selected["move_count"],
-        "mode": mode,
-        "rank": rank,
-    })
-
-    show_replay_buttons(replay)
+    if replay is not None:
+        show_replay_player(replay)
 
     if return_replay:
         return replay
@@ -805,38 +742,324 @@ def rebuild_replay(
     return None
 
 
-def compare_models_simple(comparison_specs, max_steps=MAX_STEPS):
+# -------------------------------------------------------------------
+# Browser-based replay player
+# -------------------------------------------------------------------
+
+def _replay_frame_payload(replay):
     """
-    comparison_specs: list of (name, n_games)
-    Example:
-        [("random", 100), ("greedy", 100)]
+    Convert replay frames into small JSON-friendly frontend payload.
+    This avoids sending bitboard operations to JavaScript.
     """
-    rows = []
+    payload = []
 
-    for name, n_games in comparison_specs:
-        artifact = load_experiment(
-            name=name,
-            n_games=n_games,
-            base_seed=BASE_SEED,
-            max_steps=max_steps,
-            load_replays=False,
-        )
+    for frame in replay["frames"]:
+        bitboard = int(frame["bitboard"])
+        tiles = []
 
-        s = artifact["summary"]
+        for idx in range(16):
+            exp = (bitboard >> (4 * idx)) & 0xF
+            tiles.append(0 if exp == 0 else (1 << exp))
 
-        rows.append({
-            "agent": f"{name}_{n_games}",
-            "best_score": s["best_score"],
-            "avg_score": round(s["avg_score"], 2),
-            "best_max_tile": s["best_max_tile"],
-            "avg_max_tile": round(s["avg_max_tile"], 2),
-            "avg_move_count": round(s["avg_move_count"], 2),
-            "wins": s["wins"],
+        payload.append({
+            "tiles": tiles,
+            "step": frame["step"],
+            "action": "" if frame["action"] is None else frame["action"],
+            "reward": frame["reward"],
+            "score": frame["score"],
+            "max_tile": frame["max_tile"],
         })
 
-    comparison_df = pd.DataFrame(rows)
-    display(comparison_df)
-    return comparison_df
+    return payload
+
+
+def show_replay_player(replay, steps_per_second=10, start_frame=0):
+    """
+    Front-end-only replay player.
+    Playback happens in the browser, so it avoids Python/widget update lag.
+    """
+    if replay is None:
+        print("No replay to show.")
+        return None
+
+    frames = replay.get("frames")
+    if not frames:
+        print("Replay has no frames.")
+        return None
+
+    player_id = f"replay_{uuid.uuid4().hex}"
+    payload = _replay_frame_payload(replay)
+    frames_json = json.dumps(payload)
+    max_idx = len(payload) - 1
+    start_frame = max(0, min(int(start_frame), max_idx))
+    steps_per_second = max(1, int(steps_per_second))
+
+    color_json = json.dumps(tile_colors)
+
+    html = f"""
+    <div id="{player_id}" class="replay-player">
+      <style>
+        #{player_id} {{
+          font-family: Arial, sans-serif;
+          color: #f5f5f5;
+          max-width: 720px;
+        }}
+        #{player_id} .rp-header {{
+          background:#1f2430;
+          border:1px solid #3b4252;
+          border-radius:10px;
+          padding:10px 12px;
+          line-height:1.6;
+          margin-bottom:10px;
+        }}
+        #{player_id} .rp-board {{
+          display:grid;
+          grid-template-columns:repeat(4, 58px);
+          gap:6px;
+          background:#bbada0;
+          padding:8px;
+          border-radius:8px;
+          width:max-content;
+          margin-bottom:10px;
+        }}
+        #{player_id} .rp-cell {{
+          width:58px;
+          height:58px;
+          border-radius:6px;
+          display:flex;
+          align-items:center;
+          justify-content:center;
+          font-weight:700;
+          font-size:18px;
+          font-family:Arial, sans-serif;
+        }}
+        #{player_id} .rp-controls {{
+          display:flex;
+          flex-wrap:wrap;
+          align-items:center;
+          gap:8px;
+          margin:8px 0;
+        }}
+        #{player_id} button {{
+          padding:5px 9px;
+          border-radius:6px;
+          border:1px solid #666;
+          background:#2e3440;
+          color:#f5f5f5;
+          cursor:pointer;
+        }}
+        #{player_id} button:hover {{
+          background:#3b4252;
+        }}
+        #{player_id} input[type="range"] {{
+          width:360px;
+        }}
+        #{player_id} input[type="number"] {{
+          width:60px;
+          background:#2e3440;
+          color:#f5f5f5;
+          border:1px solid #666;
+          border-radius:4px;
+          padding:4px;
+        }}
+        #{player_id} .rp-note {{
+          color:#b0b7c3;
+          margin-top:6px;
+          font-size:13px;
+        }}
+      </style>
+
+      <div class="rp-header"></div>
+      <div class="rp-board"></div>
+
+      <div class="rp-controls">
+        <button class="rp-play">Play</button>
+        <input class="rp-slider" type="range" min="0" max="{max_idx}" value="{start_frame}">
+        <span class="rp-frame-label"></span>
+      </div>
+
+      <div class="rp-controls">
+        <button data-jump="first">First</button>
+        <button data-jump="-100">-100</button>
+        <button data-jump="-10">-10</button>
+        <button data-jump="-1">Prev</button>
+        <button data-jump="1">Next</button>
+        <button data-jump="10">+10</button>
+        <button data-jump="100">+100</button>
+        <button data-jump="last">Last</button>
+        <span style="margin-left:8px;">steps/sec:</span>
+        <input class="rp-speed" type="number" min="1" max="60" value="{steps_per_second}">
+      </div>
+
+      <div class="rp-note">
+        Playback is handled in the browser to avoid Python widget lag.
+      </div>
+    </div>
+
+    <script>
+    (() => {{
+      const root = document.getElementById("{player_id}");
+      const frames = {frames_json};
+      const colors = {color_json};
+
+      const header = root.querySelector(".rp-header");
+      const board = root.querySelector(".rp-board");
+      const slider = root.querySelector(".rp-slider");
+      const playButton = root.querySelector(".rp-play");
+      const speedInput = root.querySelector(".rp-speed");
+      const frameLabel = root.querySelector(".rp-frame-label");
+
+      const seed = {json.dumps(replay.get("seed"))};
+      const gameIndex = {json.dumps(replay.get("game_index"))};
+
+      let idx = {start_frame};
+      let timer = null;
+
+      for (let i = 0; i < 16; i++) {{
+        const cell = document.createElement("div");
+        cell.className = "rp-cell";
+        board.appendChild(cell);
+      }}
+
+      const cells = Array.from(board.children);
+
+      function tileColor(value) {{
+        return colors[String(value)] || "#111111";
+      }}
+
+      function render(i) {{
+        idx = Math.max(0, Math.min(frames.length - 1, Number(i)));
+        const f = frames[idx];
+
+        header.innerHTML =
+          `<b>Seed:</b> ${{seed}} &nbsp;|&nbsp; ` +
+          `<b>Game:</b> ${{gameIndex}} &nbsp;|&nbsp; ` +
+          `<b>Frame:</b> ${{idx + 1}}/${{frames.length}} &nbsp;|&nbsp; ` +
+          `<b>Step:</b> ${{f.step}}<br>` +
+          `<b>Action:</b> ${{f.action || "None"}} &nbsp;|&nbsp; ` +
+          `<b>Reward:</b> ${{f.reward}} &nbsp;|&nbsp; ` +
+          `<b>Score:</b> ${{f.score}} &nbsp;|&nbsp; ` +
+          `<b>Max tile:</b> ${{f.max_tile}}`;
+
+        for (let c = 0; c < 16; c++) {{
+          const value = f.tiles[c];
+          const cell = cells[c];
+          cell.textContent = value === 0 ? "" : String(value);
+          cell.style.background = tileColor(value);
+          cell.style.color = value <= 4 ? "#776e65" : "white";
+        }}
+
+        slider.value = idx;
+        frameLabel.textContent = `${{idx + 1}} / ${{frames.length}}`;
+      }}
+
+      function intervalMs() {{
+        const fps = Math.max(1, Number(speedInput.value) || 1);
+        return Math.max(1, Math.floor(1000 / fps));
+      }}
+
+      function stop() {{
+        if (timer !== null) {{
+          clearInterval(timer);
+          timer = null;
+        }}
+        playButton.textContent = "Play";
+      }}
+
+      function play() {{
+        stop();
+        playButton.textContent = "Pause";
+
+        timer = setInterval(() => {{
+          if (idx >= frames.length - 1) {{
+            stop();
+            return;
+          }}
+          render(idx + 1);
+        }}, intervalMs());
+      }}
+
+      playButton.addEventListener("click", () => {{
+        if (timer === null) play();
+        else stop();
+      }});
+
+      speedInput.addEventListener("change", () => {{
+        if (timer !== null) play();
+      }});
+
+      slider.addEventListener("input", () => {{
+        render(Number(slider.value));
+      }});
+
+      root.querySelectorAll("button[data-jump]").forEach(btn => {{
+        btn.addEventListener("click", () => {{
+          const jump = btn.getAttribute("data-jump");
+          if (jump === "first") {{
+            render(0);
+          }} else if (jump === "last") {{
+            render(frames.length - 1);
+          }} else {{
+            render(idx + Number(jump));
+          }}
+        }});
+      }});
+
+      render(idx);
+    }})();
+    </script>
+    """
+
+    display(HTML(html))
+    return replay
+
+
+def show_cached_replay_player(
+    name,
+    agent_fn=None,
+    n_games=100,
+    base_seed=BASE_SEED,
+    max_steps=MAX_STEPS,
+    target_tile=None,
+    mode="best",
+    rank=1,
+    steps_per_second=10,
+    start_frame=0,
+    save_replay=True,
+    force_rebuild=False,
+    show_table=False,
+):
+    """
+    Select/load/rebuild one replay, then display it with the browser-based player.
+    """
+    replay = get_cached_replay(
+        name=name,
+        agent_fn=agent_fn,
+        n_games=n_games,
+        base_seed=base_seed,
+        max_steps=max_steps,
+        target_tile=target_tile,
+        mode=mode,
+        rank=rank,
+        save_replay=save_replay,
+        force_rebuild=force_rebuild,
+        show_table=show_table,
+    )
+
+    if replay is None:
+        return None
+
+    return show_replay_player(
+        replay=replay,
+        steps_per_second=steps_per_second,
+        start_frame=start_frame,
+    )
+
+
+# Compatibility aliases for older notebook calls
+show_replay_buttons = show_replay_player
+show_cached_replay_player_fast = show_cached_replay_player
+
 
 # -------------------------------------------------------------------
 # Comparison table helpers
@@ -846,12 +1069,6 @@ def build_comparison_df(comparison_specs, max_steps=MAX_STEPS, include_threshold
     """
     comparison_specs:
         list of (label, name, n_games)
-
-    Example:
-        [
-            ("Random", "random", 100),
-            ("Greedy", "greedy", 100),
-        ]
     """
     rows = []
 
