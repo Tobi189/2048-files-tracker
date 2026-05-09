@@ -206,20 +206,6 @@ def strip_frames_from_replay(replay):
     }
 
 
-def reached_at_least_df(artifact, thresholds=(128, 256, 512, 1024, 2048, 4096, 8192, 16384)):
-    games = artifact["games_data"]
-    total = len(games)
-
-    rows = []
-    for threshold in thresholds:
-        count = sum(1 for g in games if g["max_tile"] >= threshold)
-        rows.append({
-            "threshold": threshold,
-            "count": count,
-            "percent": 100.0 * count / total,
-        })
-
-    return pd.DataFrame(rows)
 
 
 # -------------------------------------------------------------------
@@ -702,44 +688,7 @@ def get_cached_replay(
     return replay
 
 
-def rebuild_replay(
-    name,
-    agent_fn,
-    n_games=100,
-    base_seed=BASE_SEED,
-    max_steps=MAX_STEPS,
-    target_tile=None,
-    mode="best",
-    rank=1,
-    show_table=False,
-    save_replay=True,
-    return_replay=False,
-):
-    """
-    Rebuild and display one selected replay.
-    Kept for compatibility with earlier notebook cells.
-    """
-    replay = get_cached_replay(
-        name=name,
-        agent_fn=agent_fn,
-        n_games=n_games,
-        base_seed=base_seed,
-        max_steps=max_steps,
-        target_tile=target_tile,
-        mode=mode,
-        rank=rank,
-        save_replay=save_replay,
-        force_rebuild=True,
-        show_table=show_table,
-    )
 
-    if replay is not None:
-        show_replay_player(replay)
-
-    if return_replay:
-        return replay
-
-    return None
 
 
 # -------------------------------------------------------------------
@@ -1055,10 +1004,6 @@ def show_cached_replay_player(
         start_frame=start_frame,
     )
 
-
-# Compatibility aliases for older notebook calls
-show_replay_buttons = show_replay_player
-show_cached_replay_player_fast = show_cached_replay_player
 
 
 # -------------------------------------------------------------------
