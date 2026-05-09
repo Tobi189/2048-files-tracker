@@ -1116,3 +1116,37 @@ def show_comparison_df(comparison_specs, max_steps=MAX_STEPS, include_thresholds
     )
     display(comparison_df)
     return comparison_df
+
+def compare_models_simple(comparison_specs, max_steps=MAX_STEPS):
+    """
+    comparison_specs: list of (name, n_games)
+
+    Example:
+        [("random", 100), ("greedy", 100)]
+    """
+    rows = []
+
+    for name, n_games in comparison_specs:
+        artifact = load_experiment(
+            name=name,
+            n_games=n_games,
+            base_seed=BASE_SEED,
+            max_steps=max_steps,
+            load_replays=False,
+        )
+
+        s = artifact["summary"]
+
+        rows.append({
+            "agent": f"{name}_{n_games}",
+            "best_score": s["best_score"],
+            "avg_score": round(s["avg_score"], 2),
+            "best_max_tile": s["best_max_tile"],
+            "avg_max_tile": round(s["avg_max_tile"], 2),
+            "avg_move_count": round(s["avg_move_count"], 2),
+            "wins": s["wins"],
+        })
+
+    comparison_df = pd.DataFrame(rows)
+    display(comparison_df)
+    return comparison_df

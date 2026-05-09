@@ -14,7 +14,6 @@ from collections import Counter
 from multiprocessing import Manager
 
 import pandas as pd
-import matplotlib.pyplot as plt
 import ipywidgets as widgets
 
 from tqdm.auto import tqdm

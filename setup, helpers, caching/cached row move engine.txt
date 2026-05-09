@@ -96,10 +96,10 @@ def _pack_row16(exps):
 
 def _reverse_row16(row16):
     return (
-        ((row16 & 0x000F) << 12) |
-        ((row16 & 0x00F0) << 4)  |
-        ((row16 & 0x0F00) >> 4)  |
-        ((row16 & 0xF000) >> 12)
+        ((row16 & 0x000F) << 12)
+        | ((row16 & 0x00F0) << 4)
+        | ((row16 & 0x0F00) >> 4)
+        | ((row16 & 0xF000) >> 12)
     )
 
 
@@ -210,6 +210,58 @@ def _transpose_bitboard_fast(bitboard):
     b2 = a & 0x00FF00FF00000000
     b3 = a & 0x00000000FF00FF00
     return b1 | (b2 >> 24) | (b3 << 24)
+
+
+# -------------------------------------------------------------------
+# Hot-path runtime helpers
+# -------------------------------------------------------------------
+
+def get_max_tile_fast(bitboard: BitBoard) -> int:
+    max_exp = 0
+    for idx in range(16):
+        exp = (bitboard >> (4 * idx)) & 0xF
+        if exp > max_exp:
+            max_exp = exp
+    return 0 if max_exp == 0 else (1 << max_exp)
+
+
+def spawn_random_tile_bitboard_fast(bitboard: BitBoard, rng: Optional[random.Random] = None) -> BitBoard:
+    """
+    Same logic as spawn_random_tile_bitboard, but:
+    - no repeated validation
+    - no empty-position list allocation
+    """
+    rng = rng or random
+
+    empty_count = 0
+    for idx in range(16):
+        if ((bitboard >> (4 * idx)) & 0xF) == 0:
+            empty_count += 1
+
+    if empty_count == 0:
+        return bitboard
+
+    target_empty = rng.randrange(empty_count)
+
+    chosen_idx = -1
+    for idx in range(16):
+        if ((bitboard >> (4 * idx)) & 0xF) == 0:
+            if target_empty == 0:
+                chosen_idx = idx
+                break
+            target_empty -= 1
+
+    exp = 1 if rng.random() < TWO_PROBABILITY else 2
+    shift = 4 * chosen_idx
+    return (bitboard & ~(0xF << shift)) | (exp << shift)
+
+
+def create_initial_bitboard_fast(rng: Optional[random.Random] = None) -> BitBoard:
+    rng = rng or random
+    bitboard = 0
+    bitboard = spawn_random_tile_bitboard_fast(bitboard, rng)
+    bitboard = spawn_random_tile_bitboard_fast(bitboard, rng)
+    return bitboard
 
 
 # -------------------------------------------------------------------

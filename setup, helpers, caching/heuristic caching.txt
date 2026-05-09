@@ -1,8 +1,9 @@
 # Heuristic row cache for simple expectimax-style models
 
-SIMPLE_HEURISTIC_CACHE_VERSION = "v1"
+# Heuristic row cache for search-based models
+
 SIMPLE_HEURISTIC_CACHE_REL_PATH = os.path.join(
-    "engine", f"simple_heuristic_row_cache_{SIMPLE_HEURISTIC_CACHE_VERSION}.pkl.gz"
+    "engine", "simple_heuristic_row_cache.pkl.gz"
 )
 
 
@@ -118,11 +119,11 @@ def _build_simple_heuristic_row_cache():
         row_sum[row16] = sum_term
 
         row_total_score[row16] = (
-            W_EMPTY * empty_term +
-            W_MERGE * merge_term +
-            W_MONO * mono_term +
-            W_SMOOTH * smooth_term +
-            W_SUM * sum_term
+            W_EMPTY * empty_term
+            + W_MERGE * merge_term
+            + W_MONO * mono_term
+            + W_SMOOTH * smooth_term
+            + W_SUM * sum_term
         )
 
     return {
