@@ -1,0 +1,213 @@
+# ------------------------------------------------------------
+# Safe hot-path optimization patch for conversion_aware_expectimax
+# ------------------------------------------------------------
+
+SECM_V1_MOVE_ORDER = ("down", "right", "left", "up")
+
+
+def _apply_ordered_move_secm_v1(bitboard, move):
+    """
+    Same logic as apply_move_bitboard, but avoids string normalization/dispatch overhead
+    because move is already one of the known internal move strings.
+    """
+    if move == "down":
+        return move_down_bitboard_fast(bitboard)
+    if move == "right":
+        return move_right_bitboard_fast(bitboard)
+    if move == "left":
+        return move_left_bitboard_fast(bitboard)
+    return move_up_bitboard_fast(bitboard)
+
+
+def _move_bias_from_conversion_secm_v1(conversion_mode, move):
+    if conversion_mode:
+        if move == "down":
+            return 1.5
+        if move == "right":
+            return 1.5
+        if move == "left":
+            return 0.0
+        return -1.0
+
+    if move == "down":
+        return 2.0
+    if move == "right":
+        return 2.0
+    if move == "left":
+        return 0.0
+    return -3.0
+
+
+def _finalize_candidates_secm_v1(c1, c2, c3, c4, top_k):
+    """
+    Avoid generator/list overhead for a max of four candidates.
+    """
+    if c1 is None:
+        return ()
+    if c2 is None:
+        return (c1,)
+    if c3 is None:
+        return (c1, c2)[:top_k]
+    if c4 is None:
+        return (c1, c2, c3)[:top_k]
+    return (c1, c2, c3, c4)[:top_k]
+
+
+def generate_candidates_scored_secm_v1(bitboard, legal_moves, eval_cache, info_cache, top_k):
+    """
+    Same candidate logic as before, but each candidate also stores after_score
+    so recursive search does not need another score_board cache lookup.
+    
+    Candidate format:
+        (quick_score, move, next_bitboard, reward, after_score)
+    """
+    c1 = None
+    c2 = None
+    c3 = None
+    c4 = None
+
+    info = board_info_secm_v1(bitboard, info_cache)
+    rw = info["reward_weight"]
+    conversion_mode = info["conversion_mode"]
+
+    for move in SECM_V1_MOVE_ORDER:
+        if legal_moves is not None and move not in legal_moves:
+            continue
+
+        next_bitboard, reward, changed = _apply_ordered_move_secm_v1(bitboard, move)
+        if not changed:
+            continue
+
+        after_score = score_board_secm_v1_cached(next_bitboard, eval_cache, info_cache)
+        quick_score = (
+            after_score
+            + rw * reward
+            + _move_bias_from_conversion_secm_v1(conversion_mode, move)
+        )
+
+        cand = (quick_score, move, next_bitboard, reward, after_score)
+        c1, c2, c3, c4 = _insert_candidate_desc_stable_secm_v1(c1, c2, c3, c4, cand)
+
+    return _finalize_candidates_secm_v1(c1, c2, c3, c4, top_k)
+
+
+def generate_candidates_secm_v1(bitboard, legal_moves, eval_cache, info_cache, top_k):
+    """
+    Compatibility wrapper preserving the old 4-field candidate format.
+    """
+    scored = generate_candidates_scored_secm_v1(
+        bitboard,
+        legal_moves,
+        eval_cache,
+        info_cache,
+        top_k,
+    )
+
+    return tuple(
+        (quick_score, move, next_bitboard, reward)
+        for quick_score, move, next_bitboard, reward, after_score in scored
+    )
+
+
+def player_value_secm_v1_exact_fast(bitboard, depth, cumulative_prob, tt_player, tt_chance, eval_cache, info_cache):
+    key = (bitboard, depth)
+    cached = tt_player.get(key)
+    if cached is not None:
+        return cached
+
+    if depth == 0:
+        value = score_board_secm_v1_cached(bitboard, eval_cache, info_cache)
+        tt_player[key] = value
+        return value
+
+    info = board_info_secm_v1(bitboard, info_cache)
+    top_k = info["internal_top_k"]
+    rw = info["reward_weight"]
+
+    # Logic-equivalent to get_legal_moves + generate_candidates:
+    # if no move changes the board, candidates will be empty.
+    candidates = generate_candidates_scored_secm_v1(
+        bitboard,
+        legal_moves=None,
+        eval_cache=eval_cache,
+        info_cache=info_cache,
+        top_k=top_k,
+    )
+
+    if not candidates:
+        value = score_board_secm_v1_cached(bitboard, eval_cache, info_cache)
+        tt_player[key] = value
+        return value
+
+    best_value = float("-inf")
+
+    for _, move, next_bitboard, reward, after_score in candidates:
+        value = (
+            rw * reward
+            + SECM_V1_AFTERSTATE_WEIGHT * after_score
+            + chance_value_secm_v1_exact_fast(
+                next_bitboard,
+                depth,
+                cumulative_prob,
+                tt_player,
+                tt_chance,
+                eval_cache,
+                info_cache,
+            )
+        )
+
+        if value > best_value:
+            best_value = value
+
+    tt_player[key] = best_value
+    return best_value
+
+
+def conversion_aware_expectimax(bitboard, legal_moves, rng=None):
+    rng = rng or random
+
+    maybe_trim_secm_v1_global_caches()
+
+    tt_player = {}
+    tt_chance = {}
+
+    eval_cache = SECM_V1_GLOBAL_EVAL_CACHE
+    info_cache = SECM_V1_GLOBAL_INFO_CACHE
+
+    info = board_info_secm_v1(bitboard, info_cache)
+    depth = info["depth"]
+    rw = info["reward_weight"]
+
+    candidates = generate_candidates_scored_secm_v1(
+        bitboard,
+        legal_moves=legal_moves,
+        eval_cache=eval_cache,
+        info_cache=info_cache,
+        top_k=4,
+    )
+
+    best_value = float("-inf")
+    best_moves = []
+
+    for _, move, next_bitboard, reward, after_score in candidates:
+        value = (
+            rw * reward
+            + SECM_V1_AFTERSTATE_WEIGHT * after_score
+            + chance_value_secm_v1_exact_fast(
+                next_bitboard,
+                depth,
+                1.0,
+                tt_player,
+                tt_chance,
+                eval_cache,
+                info_cache,
+            )
+        )
+
+        if value > best_value:
+            best_value = value
+            best_moves = [move]
+        elif value == best_value:
+            best_moves.append(move)
+
+    return rng.choice(best_moves) if best_moves else rng.choice(legal_moves)
